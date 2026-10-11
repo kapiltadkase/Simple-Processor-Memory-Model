@@ -1,5 +1,5 @@
 module Top
-    submodule sys : System
+    submodule sys : System<64>
 
     // ---- Non-structural parameters, seeped down from Top ----
     init $
@@ -7,23 +7,45 @@ module Top
         sys.proc.P_LOAD          = 40;   // percent
         sys.proc.P_STORE         = 30;   // percent
         sys.proc.NUM_INSTR       = 10;
-        sys.mem.DELAY            = 3;
         sys.proc.MAX_TIME        = 1000;   // Question 3 addition
+
+        sys.cache.CACHE_DELAY = 2;        // Delay for cache hit
+        sys.mem.DELAY = 20;               // Delay for Main Memory
     $
 end module
 
 
 module System
-    submodule proc : Processor
-    submodule mem  : Cache<1024, 80, 2, 20>       // structural param: size, p_hit, delay_hit, delay_miss
+    parameter int BLOCK_SIZE = 64;                // system wide parameter
 
-    net n_request  : capacity 1 width 22   // Processor -> Memory
-    net n_response : capacity 1 width 17   // Memory -> Processor
+    //Passing the size variable down to all the 3 modules
+    submodule proc : Processor<BLOCK_SIZE>
+    submodule cache : Cache<BLOCK_SIZE, 16>        // 16 is NUM_BLOCKS
+    submodule mem  : Memory<1024, BLOCK_SIZE>       // 1024 is size
 
-    proc.req_port  => n_request
-    mem.req_port   <= n_request
-    mem.resp_port  => n_response
-    proc.resp_port <= n_response
+
+    // Network wire (Processor <-> Cache)
+
+    net n_proc_req : capacity 1 width 70  // Processor -> Cache
+    net n_proc_resp : capacity 1 width 65       // Cache  -> Processor
+
+    // Network wire (cache <-> Memory)
+    net n_mem_req : capacity 1 width 70
+    net n_mem_resp : capacity 1 width 65
+
+    // Processor to cache wiring--------
+    proc.req_port => n_proc_req
+    cache.proc_req <= n_proc_req
+
+    cache.proc_resp => n_proc_resp
+    proc.resp_port  <= n_proc_resp
+
+    // Cache to memory wiring
+    cache.mem_req  => n_mem_req
+    mem.req_port <= n_mem_req
+
+    mem.resp_port => n_mem_resp
+    cache.mem_resp <= n_mem_resp
 end module
 
 
@@ -253,7 +275,7 @@ end module
 // Memory -----------------------------------------------------------------------
 
 module Cache
-    parameter int SIZE = 1024      // structural parameter: memory size in bytes
+    parameter int BLOCK_SIZE= 64      // structural parameter: memory size in bytes
     parameter int P_HIT = 80       // 80% chance of finding data
     parameter int DELAY_HIT = 2    
     parameter int DELAY_MISS = 20
