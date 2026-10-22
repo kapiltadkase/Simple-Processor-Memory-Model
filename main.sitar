@@ -1,539 +1,355 @@
+// Read nets in phase 0; write nets in phase 1.
+// Run: ./sitar_sim 10000
+
+// Connect the components and set their parameters.
 module Top
-    submodule sys : System<64>
-
-    // ---- Non-structural parameters, seeped down from Top ----
-    init $
-        sys.proc.EXECUTION_DELAY = 5;
-        sys.proc.P_LOAD          = 40;   // percent
-        sys.proc.P_STORE         = 30;   // percent
-        sys.proc.NUM_INSTR       = 10;
-        sys.proc.MAX_TIME        = 1000;   // Question 3 addition
-
-        sys.cache.CACHE_DELAY = 2;        // Delay for cache hit
-        sys.mem.DELAY = 20;               // Delay for Main Memory
+    // Sizes fixed at compile time.
+    decl $
+        enum { BLOCK_SIZE = 64, MEMORY_SIZE = 4096, NUM_BLOCKS = 16 };
     $
-end module
+    submodule proc  : Processor<BLOCK_SIZE, MEMORY_SIZE>
+    submodule cache : Cache<BLOCK_SIZE, NUM_BLOCKS, MEMORY_SIZE>
+    submodule mem   : Memory<MEMORY_SIZE, BLOCK_SIZE>
 
+    // Nets carry requests and responses between modules.
+    net n_proc_request  : capacity 1 width 4
+    net n_proc_response : capacity 1 width 5
+    net n_mem_request   : capacity 1 width 4
+    net n_mem_response  : capacity 1 width (BLOCK_SIZE+1)
+    // Signal that the processor has finished.
+    net n_finished : capacity 1
+    inport finished
 
-module System
-    parameter int BLOCK_SIZE = 64;                // system wide parameter
-
-    //Passing the size variable down to all the 3 modules
-    submodule proc : Processor<BLOCK_SIZE>
-    submodule cache : Cache<BLOCK_SIZE, 16>        // 16 is NUM_BLOCKS
-    submodule mem  : Memory<1024, BLOCK_SIZE>       // 1024 is size
-
-
-    // Network wire (Processor <-> Cache)
-
-    net n_proc_req : capacity 1 width 70  // Processor -> Cache
-    net n_proc_resp : capacity 1 width 65       // Cache  -> Processor
-
-    // Network wire (cache <-> Memory)
-    net n_mem_req : capacity 1 width 70
-    net n_mem_resp : capacity 1 width 65
-
-    // Processor to cache wiring--------
-    proc.req_port => n_proc_req
-    cache.proc_req <= n_proc_req
-
-    cache.proc_resp => n_proc_resp
-    proc.resp_port  <= n_proc_resp
-
-    // Cache to memory wiring
-    cache.mem_req  => n_mem_req
-    mem.req_port <= n_mem_req
-
-    mem.resp_port => n_mem_resp
-    cache.mem_resp <= n_mem_resp
-end module
-
-
-// Processor ----------------------------------------------------
-module Processor
-    outport req_port  : width 22
-    inport  resp_port : width 17
-
-    
-
-    include $#include <cstdlib>$
-    include $#include <cstdint>$
-    include $#include <iomanip>$
+    proc.req_port   => n_proc_request
+    cache.proc_req <= n_proc_request
+    cache.proc_resp => n_proc_response
+    proc.resp_port <= n_proc_response
+    cache.mem_req   => n_mem_request
+    mem.req_port   <= n_mem_request
+    mem.resp_port   => n_mem_response
+    cache.mem_resp <= n_mem_response
+    proc.finished  => n_finished
+    finished       <= n_finished
 
     decl $
-        // ---- configuration (defaults here; overridden from Top's init) ----
-        int EXECUTION_DELAY = 5;
-        int P_LOAD           = 40;
-        int P_STORE          = 30;
-        int NUM_INSTR        = 10;
-        int MAX_TIME         = 1000;         // question 3 addition
-
-        // ---- encodings (shared conceptually with Memory; replicated here
-
-        enum AccessType { IFETCH = 0, LOAD = 1, STORE = 2, ATOMICLOADSTORE = 3 };
-        enum SizeSpec   { WORD = 0, DOUBLEWORD = 1, QUADWORD = 2 };
-
-        // ---- loop state ----
-        int pc;                // program counter
-        int instr_count;       
-
-        // Request assembly variable
-        uint32_t req_addr;              // 32 bit address
-        uint8_t  req_type;              // 8 bit request type
-        uint8_t  req_size;              // 8 bit size
-        uint8_t  req_data[16];          //An array of 16 bytes (128 bits) used to hold the actual data if the processor is doing a STORE. (16 bytes is the max size of a QUADWORD).
-
-        // Response assembly variable
-        uint8_t  resp_error;            // 8 bit error status
-        uint8_t  resp_data[16];         // An array of 16 bytes that catches the data coming back from memory during an IFETCH or LOAD.
-
-        token<22> req_tok;              // 4 (address) + 1 (type) + 1 (size) + 16 (data) = 22 bytes
-        token<17> resp_tok;             // 1 (error) + 16 (data) = 17 bytes
-
-        bool ok;                       //bool flag to keep a tab on whether token was successfully pushed in n_request net
-        bool pulled;                   //bool flag to ensure that data was successfully pulled from n_response net
-        bool do_load;                  //bool flag to see if we can load data or not
-        bool do_store;                  
-
-        // instruction to  number of bytes translation function
-        int size_bytes(int spec) {
-            if(spec == WORD){
-                return 4;
-            }
-            else if(spec == DOUBLEWORD){
-                return 8;
-            }
-            else{
-                return 16;
-            }
-        }
-
-        // Since it is assumed that the processor is Big-
-        void encode_be(uint8_t* buf, uint64_t value, int n) {
-            // byte 0 = most-significant (stored/printed at lowest address) i.e buf[0]
-            for (int i = 0; i < n; i++) {
-                int fromLSB = n - 1 - i;
-                buf[i] = (fromLSB < 8) ? (uint8_t)((value >> (8 * fromLSB)) & 0xFF) : 0;
-            }
-        }
-        void print_bytes(const uint8_t* buf, int n) {
-            log << "0x";
-            for (int i = 0; i < n; i++)
-                log << std::hex << std::setw(2) << std::setfill('0') << (int)buf[i];
-            log << std::dec;
-        }
+        uint64_t MAX_TIME = 1000;
+        bool completed = false;
+        token<> finished_token;
     $
-
     init $
-        pc = 0;
-        instr_count = 0;
-        srand(1);   // fixed seed for reproducibility
+        // Change simulation settings here.
+        proc.TOTAL_REQUESTS = 100;
+        proc.EXECUTION_DELAY = 0;
+        proc.TEMPORAL_LOCALITY = 0.5;
+        proc.SPATIAL_LOCALITY = 0.5;
+        proc.RANDOM_SEED = 1;
+        cache.RANDOM_SEED = 2;
+        cache.CACHE_DELAY = 2;
+        mem.MEM_DELAY = 20;
+        MAX_TIME = 99;
     $
-
     behavior
+        // Wait for completion or the time limit.
         do
-            // ================= Step 1: Instruction fetch =================
-            $
-            req_type = IFETCH;
-            req_size = WORD;
-            req_addr = (uint32_t)(pc * size_bytes(WORD));                   // word-aligned, in-bounds
-
-            for (int i = 0; i < 16; i++) req_data[i] = 0;                   // cleaning up to reuse the data array
-
-            sitar::pack(req_tok, req_addr, req_type, req_size, req_data);  // 22 byte request token
-
-            ok = false;                                                    //This resets the success flag.
-
-            $;
-            do
-
-                wait until (this_phase == 1);                               // transmitting when the we are in writing phase i.e phase 1
-                $ok = req_port.push(req_tok);$;                             //trasmittig request token over the net n_request
-                if (not ok) then wait end if;                               // if processor was unable to push the token into net then it goes to sleep till the end of the current cycle
-
-            while (not ok) end do;                                          // if token successfully entered the net then the loop breaks else it goes and tries again in next cycle
-
-            $log << endl << "IFETCH  pc=" << pc << "  addr=" << req_addr;$;
-
-            wait until (this_phase == 0 and $resp_port.peek(resp_tok)$);           // processor is put to sleep until it is reading phase (i.e 0) and there is token in n_response net
-            $
-            pulled = resp_port.pull(resp_tok);                                    // pulling the response from the net into the module
-            
-            sitar::unpack(resp_tok, resp_error, resp_data);                       // opening the response token and the first 1 byte goes to resp_error, and remaining 16 bytes in resp_data array
-
-            if (resp_error) {
-                log << endl << "  IFETCH ERROR: address out of bounds";
-            } else {
-                log << endl << "  IFETCH OK  data=";
-                print_bytes(resp_data, size_bytes(WORD));
-            }
-
-            $;
-
-            // ================= Step 2: execution delay =================
-            wait(EXECUTION_DELAY, 0);                    // simulating that process is busy executing the instruction it just fetched
-
-            // ================= Step 3: probabilistic LOAD (reading data from memory)=================
-
-            $do_load = (rand() % 100) < P_LOAD;$;   
-
-            if (do_load) then                                     //  if true processor prepares its request token to send it to the memory
-                $
-                req_type = LOAD;                                  // tells the memory that want to read data
-                req_size = WORD;                                  // tells the memory how may bytes of data   
-
-                req_addr = (uint32_t)(200 + (pc * 8) % 800);      // picking a random memory address between 200 to 999 to read from 
-
-                req_addr = req_addr & ~0x3u;                      // WORD alignment (forcing last 2 bits of address to be 00 (for WORD))
-
-                for (int i = 0; i < 16; i++) req_data[i] = 0;    // cleaning out the data array to avoid sending any data
-
-                sitar::pack(req_tok, req_addr, req_type, req_size, req_data);   // packing everything up in a token
-
-                ok = false;                 
-                $;
-                do
-                    wait until (this_phase == 1);              //wait till it is writing phase to write in net n_request
-
-                    $ok = req_port.push(req_tok);$;
-
-                    if (not ok) then wait end if;
-
-                while (not ok) end do;
-
-                $log << endl << "LOAD    pc=" << pc << "  addr=" << req_addr;$;
-
-                wait until (this_phase == 0 and $resp_port.peek(resp_tok)$);
-                $
-                pulled = resp_port.pull(resp_tok);
-
-                sitar::unpack(resp_tok, resp_error, resp_data);
-
-                if (resp_error) {
-                    log << endl << "  LOAD ERROR: address out of bounds";
-                } else {
-                    log << endl << "  LOAD OK  data=";
-                    print_bytes(resp_data, size_bytes(WORD));
-                }
-                $;
-            end if;
-
-            // ================= Step 4: probabilistic STORE =================
-            $do_store = (rand() % 100) < P_STORE;$;
-            if (do_store) then
-                $
-                req_type = STORE;
-                req_size = WORD;
-                req_addr = (uint32_t)(200 + (pc * 8) % 800);
-
-                req_addr = req_addr & ~0x3u;               // WORD alignment
-                
-                encode_be(req_data, (uint64_t)(pc * 111 + 7), size_bytes(WORD));  // creating a random value to store in the memory
-
-                sitar::pack(req_tok, req_addr, req_type, req_size, req_data);
-
-                ok = false;
-                $;
-                do
-                    wait until (this_phase == 1);
-                    $ok = req_port.push(req_tok);$;
-                    if (not ok) then wait end if;
-
-                while (not ok) end do;
-                $
-                log << endl << "STORE   pc=" << pc << "  addr=" << req_addr << "  data=";
-                print_bytes(req_data, size_bytes(WORD));
-                $;
-
-                // waiting for acknowledgment
-                wait until (this_phase == 0 and $resp_port.peek(resp_tok)$);
-                $
-                pulled = resp_port.pull(resp_tok);
-                sitar::unpack(resp_tok, resp_error, resp_data);
-                if (resp_error)
-                    log << endl << "  STORE ERROR: address out of bounds";
-                else
-                    log << endl << "  STORE OK";
-                $;
-            end if;
-
-            $
-            pc++;
-            instr_count++;
-            log << endl << "--- instruction " << instr_count << " complete ---";
-            $;
-            
-        while (instr_count < NUM_INSTR and current_time <= time(MAX_TIME,0)) end do;           // question 3
-
-        $log << endl << "Processor done: " << instr_count << " instructions executed";$;
+            wait until (this_phase == 0);
+            $completed = finished.pull(finished_token);$;
+            if (not completed and this_cycle < MAX_TIME) then wait; end if;
+        while (not completed and this_cycle < MAX_TIME) end do;
+        wait until (this_phase == 1);
+        $
+        // Print the final cache statistics.
+        log << endl << "SUMMARY completed=" << completed
+            << " served=" << cache.total_requests
+            << " hits=" << cache.hits << " misses=" << cache.misses
+            << " errors=" << cache.errors << " evictions=" << cache.evictions
+            << " memory_fetches=" << mem.block_requests
+            << " received=" << proc.responses_received
+            << " hit_probability=" << std::setprecision(8)
+            << (cache.total_requests ? double(cache.hits)/cache.total_requests : 0.0);
+        if (!completed) log << endl << "Time limit reached; statistics are partial.";
+        $;
         stop simulation;
     end behavior
 end module
 
-
-
-// Memory -----------------------------------------------------------------------
-
-module Cache
-    parameter int BLOCK_SIZE= 64      // structural parameter: memory size in bytes
-    parameter int P_HIT = 80       // 80% chance of finding data
-    parameter int DELAY_HIT = 2    
-    parameter int DELAY_MISS = 20
-
-    inport  req_port  : width 22
-    outport resp_port : width 17
-
-    include $#include <cstring>$
-    include $#include <cstdint>$
-    include $#include <iomanip>$
-
+// Send one request at a time and wait for its response.
+module Processor
+    parameter int BLOCK_SIZE = 64
+    parameter int MEMORY_SIZE = 4096
+    outport req_port : width 4
+    inport resp_port : width 5
+    outport finished
+    include $
+        #include <random>
+        #include <vector>
+        #include <iomanip>
+        #include <stdexcept>
+        #include <cmath>
+    $
     decl $
-        int DELAY = 3;   // Dummy variable so Top doesn't crash!
+        static_assert(BLOCK_SIZE >= 4 && (BLOCK_SIZE & (BLOCK_SIZE-1)) == 0,
+                      "BLOCK_SIZE must be a power of two, at least four bytes");
+        static_assert(MEMORY_SIZE >= BLOCK_SIZE && MEMORY_SIZE % BLOCK_SIZE == 0,
+                      "Memory must contain whole blocks");
+        int TOTAL_REQUESTS = 100;
+        int EXECUTION_DELAY = 0;
+        double TEMPORAL_LOCALITY = 0.5, SPATIAL_LOCALITY = 0.5;
+        unsigned int RANDOM_SEED = 1;
+        std::mt19937 rng;
+        // Optional list of addresses to use instead of random ones.
+        std::vector<uint32_t> address_trace;
+        uint32_t recent_addresses[8], previous_address = 0;
+        unsigned int history_count = 0, history_next = 0;
+        uint64_t requests_sent = 0, responses_received = 0, request_cycle = 0;
+        uint32_t address;
+        uint8_t response_error, response_data[4];
+        token<4> request_token;
+        token<5> response_token;
+        token<> finished_token;
+        bool sent;
 
-        enum AccessType { IFETCH = 0, LOAD = 1, STORE = 2, ATOMICLOADSTORE = 3 };
-        enum SizeSpec   { WORD = 0, DOUBLEWORD = 1, QUADWORD = 2 };
-
-        unsigned char mem_array[SIZE];                             // physical storage for the simulation     
-
-        uint32_t req_addr;
-        uint8_t  req_type;
-        uint8_t  req_size;
-        uint8_t  req_data[16];
-
-        uint8_t  resp_error;
-        uint8_t  resp_data[16];
-
-        token<22> req_tok;
-        token<17> resp_tok;
-
-        bool pulled;
-        bool ok;
-        bool is_hit;                         //bool flag to see whether it is a hit or miss
-
-        int size_bytes(int spec) {
-            if(spec == WORD){
-                return 4;
-            }
-            else if(spec == DOUBLEWORD){
-                return 8;
-            }
-            else{
-                return 16;
-            }
+        uint32_t random_index(uint32_t count) {
+            return std::uniform_int_distribution<uint32_t>(0, count-1)(rng);
         }
-
-        void print_bytes(const uint8_t* buf, int n) {
-            log << "0x";
-            for (int i = 0; i < n; i++)
-                log << std::hex << std::setw(2) << std::setfill('0') << (int)buf[i];
-            log << std::dec;
+        uint32_t next_address() {
+            uint32_t next;
+            if (!address_trace.empty()) {
+                next = address_trace.at(requests_sent);
+            } else if (history_count && std::bernoulli_distribution(SPATIAL_LOCALITY)(rng)) {
+                // Spatial locality: choose a word in the previous block.
+                next = (previous_address / BLOCK_SIZE)*BLOCK_SIZE
+                     + 4*random_index(BLOCK_SIZE/4);
+            } else if (history_count == 8 && std::bernoulli_distribution(TEMPORAL_LOCALITY)(rng)) {
+                // Temporal locality: reuse one of the last eight addresses.
+                next = recent_addresses[random_index(8)];
+            } else {
+                // Otherwise, choose any word in memory.
+                next = 4*random_index(MEMORY_SIZE/4);
+            }
+            // Keep the last eight addresses in a circular buffer.
+            recent_addresses[history_next] = next;
+            history_next = (history_next+1) % 8;
+            if (history_count < 8) history_count++;
+            previous_address = next;
+            return next;
         }
     $
-
-    init $
-        // Simple known pattern so LOAD/IFETCH results are checkable by hand
-        for (int i = 0; i < SIZE; i++)
-            mem_array[i] = (unsigned char)(i % 256);                     //usigned char (single byte) can only hold number from 0 to 255
-    $
-
     behavior
-        // ================ (Q1) =================
         $
-        log.turnOFF();
-        log << endl << "MEM: this line is suppressed -- logger is OFF";
-        log.turnON();
-        log << endl << "MEM: logging re-enabled -- activity log begins below";
+        // Check the settings before starting.
+        if (!std::isfinite(TEMPORAL_LOCALITY) || !std::isfinite(SPATIAL_LOCALITY) ||
+            TEMPORAL_LOCALITY < 0 || TEMPORAL_LOCALITY > 1 ||
+            SPATIAL_LOCALITY < 0 || SPATIAL_LOCALITY > 1 ||
+            TOTAL_REQUESTS <= 0 || EXECUTION_DELAY < 0)
+            throw std::runtime_error("Invalid processor configuration");
+        rng.seed(RANDOM_SEED);
+        if (!address_trace.empty()) TOTAL_REQUESTS = (int)address_trace.size();
         $;
-
         do
-            // ---------- Wait for and pull a request (phase 0) ----------
-            $pulled = false;$;
-            do
-                wait until (this_phase == 0);
-                $pulled = req_port.pull(req_tok);$;
-                if (not pulled) then wait end if;
-            while (not pulled) end do;
-
-            $sitar::unpack(req_tok, req_addr, req_type, req_size, req_data);$;
-
-            // ---------- Simulate access latency ----------
-            $
-            is_hit = (rand() % 100) < P_HIT;           // finding out if it is a hit or a miss
-            $;
-            
-            if(is_hit) then
-                $log << endl << " [CACHE HIT]";$;
-                wait(DELAY_HIT,0);
-            
-            else
-                $log << endl << "  [CACHE MISS] Fetching from lower memory...";$;
-                wait(DELAY_MISS, 0);
-            end if;
-
-            // ---------- Perform the access ----------
-            $
-            int n = size_bytes(req_size);                                                 // translate WORD -> actual bytes i.e 4
-            bool in_bounds = ((uint64_t)req_addr + (uint64_t)n) <= (uint64_t)SIZE;        // the bounds check (safety first)
-
-            resp_error = 0;                                                               // default response template (assuming everything went right)
-            for (int i = 0; i < 16; i++) resp_data[i] = 0;                                // cleaning out to make sure it doesnt send the old data back
-
-            if (!in_bounds) {                                                             // when out-of-bounds throw and error
-                resp_error = 1;
-                log << endl << "MEM ERROR: out-of-bounds  addr=" << req_addr
-                    << "  type=" << (int)req_type;
-            } 
-            else {
-                if (req_type == STORE || req_type == ATOMICLOADSTORE) {
-
-                    memcpy(&mem_array[req_addr], req_data, n);                           //copying n bytes from the req_data array into mem_array starting at req_addr
-                    log << endl << "MEM WRITE  addr=" << req_addr << "  data=";
-                    print_bytes(req_data, n);
-                }
-                if (req_type == IFETCH || req_type == LOAD || req_type == ATOMICLOADSTORE) {
-                    memcpy(resp_data, &mem_array[req_addr], n);                         //copying n bytes from the mem_array  into req_data starting at req_addr in mem_array
-                    log << endl << "MEM READ   addr=" << req_addr << "  data=";
-                    print_bytes(resp_data, n);
-                }
-            }
-
-            sitar::pack(resp_tok, resp_error, resp_data);                              // packing the resp_data into and error_status into a token
-            ok = false;
-            $;
-
-            // ---------- Send response (phase 1) ----------
+            // Choose an address and pack it into a request.
+            $address = next_address(); sitar::pack(request_token, address); sent = false;$;
+            // Send in phase 1; retry if the net is full.
             do
                 wait until (this_phase == 1);
-                $ok = resp_port.push(resp_tok);$;
-                if (not ok) then wait end if;
-            while (not ok) end do;
+                $sent = req_port.push(request_token);$;
+                if (not sent) then wait; end if;
+            while (not sent) end do;
+            $
+            request_cycle = current_time.cycle();
+            requests_sent++;
+            log << endl << "REQUEST index=" << requests_sent << " address=" << address;
+            $;
+            // Wait until a response is available to read.
+            wait until (this_phase == 0 and $resp_port.peek(response_token)$);
+            $
+            resp_port.pull(response_token);
+            sitar::unpack(response_token, response_error, response_data);
+            responses_received++;
+            log << endl << "RESPONSE address=" << address << " error=" << (int)response_error
+                << " latency=" << current_time.cycle()-request_cycle << " data=0x";
+            for (int i=0; i<4; i++)
+                log << std::hex << std::setw(2) << std::setfill('0') << (int)response_data[i];
+            log << std::dec << std::setfill(' ');
+            $;
+            // Simulate processor work between requests.
+            if ($responses_received < (uint64_t)TOTAL_REQUESTS$) then
+                wait(EXECUTION_DELAY,0);
+            end if;
+        while ($responses_received < (uint64_t)TOTAL_REQUESTS$) end do;
+        wait until (this_phase == 1);
+        // Tell Top that all responses have arrived.
+        $if (!finished.push(finished_token)) throw std::runtime_error("Completion channel full");$;
+    end behavior
+end module
+
+// Store memory blocks and fetch missing ones.
+module Cache
+    parameter int BLOCK_SIZE = 64
+    parameter int NUM_BLOCKS = 16
+    parameter int MEMORY_SIZE = 4096
+    inport proc_req : width 4
+    outport proc_resp : width 5
+    outport mem_req : width 4
+    inport mem_resp : width (BLOCK_SIZE+1)
+    include $
+        #include <random>
+        #include <cstring>
+        #include <stdexcept>
+    $
+    decl $
+        static_assert(NUM_BLOCKS > 0, "Cache must contain at least one block");
+        static_assert(BLOCK_SIZE >= 4 && (BLOCK_SIZE & (BLOCK_SIZE-1)) == 0,
+                      "Invalid block size");
+        int CACHE_DELAY = 2;
+        unsigned int RANDOM_SEED = 2;
+        std::mt19937 rng;
+        // Each entry holds data, a block tag, and a valid bit.
+        struct CacheBlock {
+            uint8_t data[BLOCK_SIZE];
+            uint32_t tag;
+            bool valid;
+        } blocks[NUM_BLOCKS];
+        uint64_t total_requests = 0, hits = 0, misses = 0, errors = 0, evictions = 0;
+        uint32_t address, tag, offset, block_address;
+        int slot;
+        bool hit, legal, sent;
+        uint8_t response_error, response_data[4], fetched_data[BLOCK_SIZE];
+        token<4> request_token, block_request_token;
+        token<5> response_token;
+        token<BLOCK_SIZE+1> block_response_token;
+    $
+    init $
+        // Start with an empty cache.
+        for (int i=0; i<NUM_BLOCKS; i++) { blocks[i].valid=false; blocks[i].tag=0; }
+    $
+    behavior
+        $
+        if (CACHE_DELAY < 0) { throw std::runtime_error("Negative cache delay"); }
+        rng.seed(RANDOM_SEED);
+        $;
+        do
+            wait until (this_phase == 0 and $proc_req.peek(request_token)$);
+            $
+            proc_req.pull(request_token);
+            sitar::unpack(request_token, address);
+            // Split the address into a block tag and byte offset.
+            tag = address / BLOCK_SIZE;
+            offset = address % BLOCK_SIZE;
+            block_address = address-offset;
+            slot = -1;
+            // Check word alignment and memory bounds.
+            legal = address % 4 == 0 && (uint64_t)address+4 <= MEMORY_SIZE;
+            // Search all cache entries for a matching tag.
+            if (legal) for (int i=0; i<NUM_BLOCKS; i++)
+                if (blocks[i].valid && blocks[i].tag == tag) { slot=i; break; }
+            hit = slot >= 0;
+            response_error = legal ? 0 : (address % 4 ? 2 : 1);
+            std::memset(response_data, 0, sizeof(response_data));
+            log << endl << "LOOKUP address=" << address << " tag=" << tag << " offset=" << offset
+                << " result=" << (!legal ? "ERROR" : hit ? "HIT" : "MISS");
+            $;
+            // Cache miss: request the whole block from memory.
+            if (legal and not hit) then
+                $sitar::pack(block_request_token, block_address); sent=false;$;
+                do
+                    wait until (this_phase == 1);
+                    $sent = mem_req.push(block_request_token);$;
+                    if (not sent) then wait; end if;
+                while (not sent) end do;
+                wait until (this_phase == 0 and $mem_resp.peek(block_response_token)$);
+                $
+                mem_resp.pull(block_response_token);
+                sitar::unpack(block_response_token, response_error, fetched_data);
+                if (!response_error) {
+                    // Use an empty slot if one is available.
+                    for (int i=0; i<NUM_BLOCKS; i++) if (!blocks[i].valid) { slot=i; break; }
+                    // Cache full: replace a random entry.
+                    if (slot < 0) {
+                        slot = std::uniform_int_distribution<int>(0, NUM_BLOCKS-1)(rng);
+                        evictions++;
+                        log << endl << "EVICT slot=" << slot << " old_tag=" << blocks[slot].tag;
+                    }
+                    // Save the fetched block in the cache.
+                    std::memcpy(blocks[slot].data, fetched_data, BLOCK_SIZE);
+                    blocks[slot].tag = tag;
+                    blocks[slot].valid = true;
+                    log << endl << "FILL slot=" << slot << " tag=" << tag;
+                }
+                $;
+            end if;
+            // Both hits and misses pay the cache delay.
+            wait(CACHE_DELAY,0);
+            $
+            if (!response_error) {
+                // Return the requested word and update the counters.
+                std::memcpy(response_data, &blocks[slot].data[offset], 4);
+                total_requests++;
+                if (hit) hits++; else misses++;
+            } else errors++;
+            sitar::pack(response_token, response_error, response_data);
+            sent=false;
+            $;
+            // Send in phase 1; retry if the net is full.
+            do
+                wait until (this_phase == 1);
+                $sent = proc_resp.push(response_token);$;
+                if (not sent) then wait; end if;
+            while (not sent) end do;
         while (1) end do;
     end behavior
 end module
 
-
-
-// Memory-----------------------------------------------------------------------------------
-
-
+// Return a full memory block to the cache.
 module Memory
-    parameter int SIZE = 1024      // structural parameter: memory size in bytes
-
-    inport  req_port  : width 22
-    outport resp_port : width 17
-
-    include $#include <cstring>$
-    include $#include <cstdint>$
-    include $#include <iomanip>$
-
+    parameter int SIZE = 4096
+    parameter int BLOCK_SIZE = 64
+    inport req_port : width 4
+    outport resp_port : width (BLOCK_SIZE+1)
+    include $
+        #include <cstring>
+        #include <stdexcept>
+    $
     decl $
-        int DELAY = 3;   // default; overridden from Top's init
-
-        enum AccessType { IFETCH = 0, LOAD = 1, STORE = 2, ATOMICLOADSTORE = 3 };
-        enum SizeSpec   { WORD = 0, DOUBLEWORD = 1, QUADWORD = 2 };
-
-        unsigned char mem_array[SIZE];                             // physical storage for the simulation     
-
-        uint32_t req_addr;
-        uint8_t  req_type;
-        uint8_t  req_size;
-        uint8_t  req_data[16];
-
-        uint8_t  resp_error;
-        uint8_t  resp_data[16];
-
-        token<22> req_tok;
-        token<17> resp_tok;
-
-        bool pulled;
-        bool ok;
-
-        int size_bytes(int spec) {
-            if(spec == WORD){
-                return 4;
-            }
-            else if(spec == DOUBLEWORD){
-                return 8;
-            }
-            else{
-                return 16;
-            }
-        }
-
-        void print_bytes(const uint8_t* buf, int n) {
-            log << "0x";
-            for (int i = 0; i < n; i++)
-                log << std::hex << std::setw(2) << std::setfill('0') << (int)buf[i];
-            log << std::dec;
-        }
+        static_assert(SIZE > 0 && (SIZE & (SIZE-1)) == 0, "SIZE must be a power of two");
+        static_assert(SIZE >= BLOCK_SIZE && SIZE % BLOCK_SIZE == 0, "Incomplete memory block");
+        int MEM_DELAY = 20;
+        uint8_t mem_array[SIZE], block_data[BLOCK_SIZE], response_error;
+        uint32_t block_address;
+        uint64_t block_requests = 0;
+        token<4> request_token;
+        token<BLOCK_SIZE+1> response_token;
+        bool sent;
     $
-
-    init $
-        // Simple known pattern so LOAD/IFETCH results are checkable by hand
-        for (int i = 0; i < SIZE; i++)
-            mem_array[i] = (unsigned char)(i % 256);                     //usigned char (single byte) can only hold number from 0 to 255
-    $
-
+    // Fill memory with a predictable byte pattern.
+    init $for (int i=0; i<SIZE; i++) mem_array[i]=uint8_t(i % 256);$
     behavior
-        // ================ (Q1) =================
-        $
-        log.turnOFF();
-        log << endl << "MEM: this line is suppressed -- logger is OFF";
-        log.turnON();
-        log << endl << "MEM: logging re-enabled -- activity log begins below";
-        $;
-
+        $if (MEM_DELAY < 0) throw std::runtime_error("Negative memory delay");$;
         do
-            // ---------- Wait for and pull a request (phase 0) ----------
-            $pulled = false;$;
-            do
-                wait until (this_phase == 0);
-                $pulled = req_port.pull(req_tok);$;
-                if (not pulled) then wait end if;
-            while (not pulled) end do;
-
-            $sitar::unpack(req_tok, req_addr, req_type, req_size, req_data);$;
-
-            // ---------- Simulate access latency ----------
-            wait(DELAY, 0);
-
-            // ---------- Perform the access ----------
+            wait until (this_phase == 0 and $req_port.peek(request_token)$);
             $
-            int n = size_bytes(req_size);                                                 // translate WORD -> actual bytes i.e 4
-            bool in_bounds = ((uint64_t)req_addr + (uint64_t)n) <= (uint64_t)SIZE;        // the bounds check (safety first)
-
-            resp_error = 0;                                                               // default response template (assuming everything went right)
-            for (int i = 0; i < 16; i++) resp_data[i] = 0;                                // cleaning out to make sure it doesnt send the old data back
-
-            if (!in_bounds) {                                                             // when out-of-bounds throw and error
-                resp_error = 1;
-                log << endl << "MEM ERROR: out-of-bounds  addr=" << req_addr
-                    << "  type=" << (int)req_type;
-            } 
-            else {
-                if (req_type == STORE || req_type == ATOMICLOADSTORE) {
-
-                    memcpy(&mem_array[req_addr], req_data, n);                           //copying n bytes from the req_data array into mem_array starting at req_addr
-                    log << endl << "MEM WRITE  addr=" << req_addr << "  data=";
-                    print_bytes(req_data, n);
-                }
-                if (req_type == IFETCH || req_type == LOAD || req_type == ATOMICLOADSTORE) {
-                    memcpy(resp_data, &mem_array[req_addr], n);                         //copying n bytes from the mem_array  into req_data starting at req_addr in mem_array
-                    log << endl << "MEM READ   addr=" << req_addr << "  data=";
-                    print_bytes(resp_data, n);
-                }
-            }
-
-            sitar::pack(resp_tok, resp_error, resp_data);                              // packing the resp_data into and error_status into a token
-            ok = false;
+            req_port.pull(request_token);
+            sitar::unpack(request_token, block_address);
+            block_requests++;
+            log << endl << "BLOCK_READ address=" << block_address << " bytes=" << BLOCK_SIZE;
             $;
-
-            // ---------- Send response (phase 1) ----------
+            // Simulate memory access time.
+            wait(MEM_DELAY,0);
+            $
+            response_error=0;
+            std::memset(block_data, 0, sizeof(block_data));
+            // Check the block address before reading memory.
+            if ((uint64_t)block_address+BLOCK_SIZE > SIZE) response_error=1;
+            else if (block_address % BLOCK_SIZE) response_error=2;
+            else std::memcpy(block_data, &mem_array[block_address], BLOCK_SIZE);
+            sitar::pack(response_token, response_error, block_data);
+            sent=false;
+            $;
+            // Send in phase 1; retry if the net is full.
             do
                 wait until (this_phase == 1);
-                $ok = resp_port.push(resp_tok);$;
-                if (not ok) then wait end if;
-            while (not ok) end do;
+                $sent = resp_port.push(response_token);$;
+                if (not sent) then wait; end if;
+            while (not sent) end do;
         while (1) end do;
     end behavior
 end module
