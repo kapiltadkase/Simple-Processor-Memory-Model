@@ -1,65 +1,81 @@
-# Set-associative processor caches
+# Blocking write-back caches
 
-Build with `sitar translate main.sitar`, then `sitar compile`. Run
-`./sitar_sim 1000`; success prints `PASS requests_per_cache=20`.
-Run `python3 check.py` for configuration and delay checks.
+Build with `sitar translate main.sitar`, then `sitar compile`.
+Run `./sitar_sim 1000`; require `PASS requests_per_cache=20`.
+Run `python3 check.py` for the configuration and workload checks.
 
-Top connects Core to separate instruction and data memories. Core runs the
-processor and two instances of the same Cache procedure concurrently, using
-shared request/response sequence numbers. External memory uses phase-0 reads
-and phase-1 writes. One request per cache may be outstanding.
+Core runs the processor and two Cache procedures concurrently. Each cache has
+its own external memory. Shared request/response sequence numbers allow one
+outstanding request per cache and same-phase completion for zero-delay hits.
+External memory reads occur in phase 0 and writes in phase 1.
 
-Cache has structural template parameters NUM_SETS, NUM_WAYS, and BLOCK_SIZE.
-Change their defaults in `main.sitar` to configure both caches and rebuild.
-Each must be a positive power of two. This word-access model supports block
-sizes from 4 through 256 bytes, matching its aligned 32-bit accesses and 256-byte
-memory. The default is two sets, two ways, and 16 bytes per block (64 bytes total).
-Each block contains byte data, a tag, and a valid bit.
+NUM_SETS, NUM_WAYS, and BLOCK_SIZE are structural template parameters; edit
+their defaults in main.sitar and rebuild. All must be powers of two. The default
+is two sets, two ways, and 16-byte blocks. Aligned 32-bit accesses and a 256-byte
+memory limit supported block sizes to 4 through 256 bytes.
 
 For address a, offset = a % BLOCK_SIZE, set = (a / BLOCK_SIZE) % NUM_SETS,
-and tag = a / BLOCK_SIZE / NUM_SETS. Lookup examines all ways in that set.
-A miss uses an invalid way first; a full set evicts a uniformly selected random
-way. A fixed seed makes runs reproducible. Block fills read consecutive words
-from external memory and install the block only after successful completion.
-Words are stored in cache bytes in big-endian order. Stores remain write-through
-and write-allocate: memory is updated before a missing block is fetched.
+and tag = a / BLOCK_SIZE / NUM_SETS. Lookup searches only the selected set.
+A miss uses an invalid way first, otherwise a uniformly random victim from
+that set. A fixed seed makes the replacement sequence reproducible.
 
-CACHE_DELAY and MEM_DELAY are independent whole-cycle parameters initialized
-in Top. Every cache access pays CACHE_DELAY; a miss additionally pays for each
-word fetched, including net transport. A zero-delay hit completes in the same
-phase. Block transfers are serialized words, so a larger block costs more to
-fill. There are no dirty bits or write-back behavior.
+Each block holds bytes, a tag, a valid bit, and a dirty bit. A store hit updates
+cached bytes and sets dirty without accessing memory. A miss first writes a
+valid dirty victim's entire block to its original memory address. Only after
+all writes succeed does it clear dirty and increment writebacks. It then
+fetches the requested block, installs it clean, and performs the original
+load or store. A store miss therefore leaves the newly allocated block dirty.
+Data words are assembled and split in big-endian order.
 
-## Validation and comparison
+Write-back and fill use serialized word transfers through the existing memory
+interface. Each word incurs MEM_DELAY plus net transport delay; writing a full
+block costs the same transfer time as reading a full block. Every cache request
+also pays CACHE_DELAY. Both delays are initialized independently in Top.
+The cache blocks during eviction and fill. The other cache can still proceed.
+Failed write-back preserves the victim's valid and dirty state; failed fills
+are never installed as valid.
 
-The processor uses general names such as addresses, index, slot, way, and tag.
-Its 20-request trace checks returned data, stored-value persistence, instruction
-and data isolation, invalid alignment and range, hit/miss accounting, spatial
-hits, repeated hits, and exact hit delay. Both caches must start each pair at
-the issue timestamp; completion must equal the later cache completion time.
-Assertions must stay enabled, and a run must reach PASS.
+## Validation
 
-The comparison holds capacity at four 16-byte blocks and varies the layout:
-4 sets x 1 way (direct-mapped), 2 sets x 2 ways, and 1 set x 4 ways (fully
-associative). Addresses 0, 64, 128, and 192 intentionally map to one set in
-all three configurations. Greater associativity can retain more of those
-blocks, reducing conflict misses. This is a conflict-heavy trace, not a claim
-that every workload benefits equally. Random eviction results depend on the
-seed and request sequence.
+The 20-request mixed trace uses an independent array of expected data. It checks
+loads and stores, dirty-data persistence across eviction/reload, instruction
+memory isolation, invalid addresses, request accounting, concurrent start
+and completion, and exact hit latency for both loads and stores. Store values
+change with each request, making stale data visible. The final log reports
+hits, misses, and block write-backs. Assertions must remain enabled.
 
-The check script also tests cache/memory delays (2,0), (0,3), and (2,3),
-and block sizes 4 and 256. It builds temporary copies without modifying the
-working model and fails if compilation, assertions, or the PASS marker fail.
+check.py runs the mixed trace with direct-mapped, two-way, and fully associative
+layouts, independent zero/nonzero delays, and block sizes 4 and 256. It also
+runs three controlled workload boundaries with the default layout:
 
-Measured results with both configured delays zero (hits/misses per cache;
-two invalid requests excluded):
+- No stores: write-backs must remain zero.
+- Frequent stores within one block: high temporal and spatial locality keep
+  dirty data resident, so eviction write-backs remain zero.
+- Frequent stores across the memory: low locality exceeds cache capacity,
+  forcing dirty evictions. This trace also accesses different sets; the mixed
+  trace checks stored-value persistence with subsequent loads.
 
-| Sets | Ways | Hits | Misses | Completion cycle |
+These deterministic workloads represent store-frequency and locality extremes;
+they do not implement a probabilistic P_STORE or locality sweep. More stores
+can create more dirty victims, but repeated stores to a resident block combine
+into one eventual block write-back. Low locality causes more evictions and
+therefore more write-backs when the evicted blocks are dirty.
+
+Dirty resident blocks are not flushed when simulation stops. Reported counts
+measure eviction write-backs only; memory can legitimately lag cached data at
+termination. No coherence or non-blocking requests are modeled.
+
+All 11 checks pass. With the default layout and zero processing delays:
+
+| Workload | Data hits | Data misses | Write-backs | Completion cycle |
 | --- | --- | --- | --- | --- |
-| 4 | 1 | 4 | 14 | 114 |
-| 2 | 2 | 7 | 11 | 90 |
-| 1 | 4 | 14 | 4 | 34 |
+| No stores | 7 | 11 | 0 | 88 |
+| Local stores | 17 | 1 | 0 | 8 |
+| Streaming stores | 0 | 18 | 14 | 256 |
+| Mixed | 7 | 11 | 6 | 136 |
 
-For the default two-way layout, delay pairs (2,0), (0,3), and (2,3)
-finish at cycles 130, 225, and 265 respectively, with unchanged hit counts.
-All eight tested configurations pass.
+The mixed trace takes 168 cycles with 7 write-backs for four sets/one way,
+and 32 cycles with no write-backs for one set/four ways. For the default
+layout, delay pairs (2,0), (0,3), and (2,3) finish at cycles 176, 340, and
+380, all with six write-backs. Instruction-cache write-backs are zero in
+every run because instruction requests are reads only.
