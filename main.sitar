@@ -28,8 +28,8 @@ module Core
     outport data_request : width 9
     inport data_response : width 5
     procedure processor : Processor
-    procedure instruction_cache : Cache
-    procedure data_cache : Cache
+    procedure instruction_cache : Cache<>
+    procedure data_cache : Cache<>
     init $
         instruction_cache.memory_request = &instruction_request;
         instruction_cache.memory_response = &instruction_response;
@@ -44,9 +44,13 @@ module Core
 end module
 
 procedure Cache
+    parameter int NUM_SETS = 2
+    parameter int NUM_WAYS = 2
+    parameter int BLOCK_SIZE = 16
     include $
         #include <cassert>
         #include <stdexcept>
+        #include <random>
     $
     decl $
         int CACHE_DELAY = 0;
@@ -56,13 +60,25 @@ procedure Cache
         uint32_t address = 0, write_data = 0, read_data = 0;
         uint8_t write = 0, error = 0;
         uint64_t start_time = 0, finish_time = 0, hits = 0, misses = 0;
-        // shortcut: four direct-mapped word lines; use block fills for cache-performance studies.
-        bool valid[4] = {};
-        uint32_t tags[4] = {}, values[4] = {};
-        uint32_t saved_address, saved_data;
+        static_assert(NUM_SETS > 0 && !(NUM_SETS & (NUM_SETS-1)), "Invalid set count");
+        static_assert(NUM_WAYS > 0 && !(NUM_WAYS & (NUM_WAYS-1)), "Invalid way count");
+        static_assert(BLOCK_SIZE >= 4 && BLOCK_SIZE <= 256 && !(BLOCK_SIZE & (BLOCK_SIZE-1)), "Invalid block size");
+        bool valid[NUM_SETS][NUM_WAYS] = {};
+        uint32_t tags[NUM_SETS][NUM_WAYS] = {};
+        uint8_t values[NUM_SETS][NUM_WAYS][BLOCK_SIZE] = {};
+        std::mt19937 generator{1};
+        uint32_t saved_address, saved_data, tag, base;
         uint8_t saved_write;
         uint64_t active_id;
-        int slot;
+        int slot, way, offset, position;
+        void save_word(int pos, uint32_t value) {
+            for (int i=0; i<4; i++) values[slot][way][pos+i] = value >> (24-8*i);
+        }
+        uint32_t load_word() {
+            uint32_t value = 0;
+            for (int i=0; i<4; i++) value = (value << 8) | values[slot][way][offset+i];
+            return value;
+        }
         bool hit, sent;
         token<9> request_token;
         token<5> response_token;
@@ -78,14 +94,26 @@ procedure Cache
             saved_address = address; saved_data = write_data; saved_write = write;
             start_time = current_time.toUint64();
             error = saved_write > 1 ? 3 : saved_address % 4 ? 2 : saved_address > 252 ? 1 : 0;
-            slot = (saved_address/4) % 4;
-            hit = !error && valid[slot] && tags[slot] == saved_address;
+            base = saved_address / BLOCK_SIZE * BLOCK_SIZE;
+            offset = saved_address % BLOCK_SIZE;
+            slot = (saved_address / BLOCK_SIZE) % NUM_SETS;
+            tag = saved_address / BLOCK_SIZE / NUM_SETS;
+            way = -1;
+            for (int i=0; i<NUM_WAYS; i++)
+                if (valid[slot][i] && tags[slot][i] == tag) way = i;
+            hit = !error && way >= 0;
+            if (!error && !hit) {
+                for (int i=0; i<NUM_WAYS; i++)
+                    if (!valid[slot][i]) { way=i; break; }
+                if (way < 0) way = std::uniform_int_distribution<int>(0, NUM_WAYS-1)(generator);
+                valid[slot][way] = false;
+            }
             read_data = 0;
             if (!error) { if (hit) hits++; else misses++; }
             $;
             wait(CACHE_DELAY,0);
             if (not error) then
-                if (saved_write or not hit) then
+                if (saved_write) then
                     $sitar::pack(request_token, saved_write, saved_address, saved_data); sent=false;$;
                     do
                         wait until (this_phase == 1);
@@ -93,14 +121,26 @@ procedure Cache
                         if (not sent) then wait; end if;
                     while (not sent) end do;
                     wait until (this_phase == 0 and $memory_response->peek(response_token)$);
-                    $
-                    memory_response->pull(response_token);
-                    sitar::unpack(response_token, error, read_data);
-                    if (!error) { valid[slot]=true; tags[slot]=saved_address; values[slot]=read_data; }
-                    $;
-                else
-                    $read_data = values[slot];$;
+                    $memory_response->pull(response_token); sitar::unpack(response_token, error, read_data);$;
+                    if (not error and hit) then $save_word(offset, read_data);$; end if;
                 end if;
+                if (not error and not hit) then
+                    $position=0;$;
+                    do
+                        $sitar::pack(request_token, uint8_t(0), uint32_t(base+position), uint32_t(0)); sent=false;$;
+                        do
+                            wait until (this_phase == 1);
+                            $sent = memory_request->push(request_token);$;
+                            if (not sent) then wait; end if;
+                        while (not sent) end do;
+                        wait until (this_phase == 0 and $memory_response->peek(response_token)$);
+                        $memory_response->pull(response_token); sitar::unpack(response_token, error, read_data);
+                        if (!error) save_word(position, read_data);
+                        position+=4;$;
+                    while (not error and position < BLOCK_SIZE) end do;
+                    $if (!error) { valid[slot][way]=true; tags[slot][way]=tag; }$;
+                end if;
+                $read_data = error ? 0 : load_word();$;
             end if;
             $
             finish_time = current_time.toUint64();
@@ -119,23 +159,26 @@ procedure Processor
         #include <algorithm>
     $
     decl $
-        Cache* instruction_cache = nullptr;
-        Cache* data_cache = nullptr;
-        const uint32_t addresses[10] = {0,0,0,0,16,0,256,2,0,0};
+        Cache<>* instruction_cache = nullptr;
+        Cache<>* data_cache = nullptr;
+        const uint32_t addresses[20] = {0,4,0,0,64,0,256,2,128,192,0,64,128,192,0,64,128,192,0,4};
         int index = 0;
         uint64_t issue_time;
-        void submit(Cache* cache, bool store) {
+        void submit(Cache<>* cache, bool store) {
             assert(cache->request_id == cache->response_id);
             cache->address = addresses[index];
             cache->write = store;
             cache->write_data = 777;
             cache->request_id++;
         }
-        void check(Cache* cache, bool data_path) {
+        void check(Cache<>* cache, bool data_path) {
             uint8_t expected_error = index == 6 ? 1 : index == 7 ? 2 : 0;
             uint32_t expected_data = expected_error ? 0 :
-                data_path && index >= 2 && index != 4 ? 777 : addresses[index]/4;
+                data_path && index >= 2 && addresses[index] == 0 ? 777 : addresses[index]/4;
             assert(cache->response_id == uint64_t(index+1));
+            assert(cache->hits + cache->misses == uint64_t(index+1 - (index >= 6) - (index >= 7)));
+            if (index == 1 && sizeof(cache->values[0][0]) >= 8) assert(cache->hit);
+            if (index == 3) assert(cache->hit);
             assert(cache->start_time == issue_time);
             assert(cache->error == expected_error && cache->read_data == expected_data);
             if (!expected_error && cache->hit && !cache->write)
@@ -162,8 +205,11 @@ procedure Processor
                 << " finish=" << current_time;
             index++;
             $;
-        while (index < 10) end do;
-        $log << endl << "PASS requests_per_cache=" << index;$;
+        while (index < 20) end do;
+        $log << endl << "PASS requests_per_cache=" << index
+            << " hits=" << instruction_cache->hits << " misses=" << instruction_cache->misses
+            << " data_hits=" << data_cache->hits << " data_misses=" << data_cache->misses
+            << " finish=" << current_time;$;
         stop simulation;
     end behavior
 end procedure

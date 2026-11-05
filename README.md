@@ -1,52 +1,65 @@
-# Concurrent processor and caches
+# Set-associative processor caches
 
 Build with `sitar translate main.sitar`, then `sitar compile`. Run
-`./sitar_sim 1000`. Success prints `PASS requests_per_cache=10`.
+`./sitar_sim 1000`; success prints `PASS requests_per_cache=20`.
+Run `python3 check.py` for configuration and delay checks.
 
-Top contains one Core compute module and two external Memory modules. Core runs
-`processor`, `instruction_cache`, and `data_cache` in a parallel block. Both
-caches are instances of the same Cache procedure class. Change CACHE_DELAY and
-MEM_DELAY independently in Top's init block; zero and positive cycle delays are
-supported.
+Top connects Core to separate instruction and data memories. Core runs the
+processor and two instances of the same Cache procedure concurrently, using
+shared request/response sequence numbers. External memory uses phase-0 reads
+and phase-1 writes. One request per cache may be outstanding.
 
-The processor sets each cache's address, write flag, and write_data, then
-increments request_id. The cache snapshots those fields and publishes read_data
-and error before updating response_id. One request may be outstanding per cache.
-Sequence numbers allow consecutive same-phase requests without losing a brief
-boolean handshake transition.
+Cache has structural template parameters NUM_SETS, NUM_WAYS, and BLOCK_SIZE.
+Change their defaults in `main.sitar` to configure both caches and rebuild.
+Each must be a positive power of two. This word-access model supports block
+sizes from 4 through 256 bytes, matching its aligned 32-bit accesses and 256-byte
+memory. The default is two sets, two ways, and 16 bytes per block (64 bytes total).
+Each block contains byte data, a tag, and a valid bit.
 
-Sitar interleaves parallel branches and re-executes them until no branch can
-advance in the current phase. A wait-until condition can become true through
-another branch without advancing time. Thus a zero-delay cache hit returns in
-the same cycle and phase. These procedures share one module's state; they are
-not independent operating-system threads. The installed examples
-`/home/kapil/sitar/examples/7_Parallel.sitar` and `8_Procedures.sitar` illustrate
-these constructs.
+For address a, offset = a % BLOCK_SIZE, set = (a / BLOCK_SIZE) % NUM_SETS,
+and tag = a / BLOCK_SIZE / NUM_SETS. Lookup examines all ways in that set.
+A miss uses an invalid way first; a full set evicts a uniformly selected random
+way. A fixed seed makes runs reproducible. Block fills read consecutive words
+from external memory and install the block only after successful completion.
+Words are stored in cache bytes in big-endian order. Stores remain write-through
+and write-allocate: memory is updated before a missing block is fetched.
 
-Only external memory uses nets. Even MEM_DELAY=0 leaves request/response
-transport delay: cold reads issued at (0,0) return at (2,0). The next pair of
-cached reads starts and finishes at (2,0), demonstrating actual zero latency.
+CACHE_DELAY and MEM_DELAY are independent whole-cycle parameters initialized
+in Top. Every cache access pays CACHE_DELAY; a miss additionally pays for each
+word fetched, including net transport. A zero-delay hit completes in the same
+phase. Block transfers are serialized words, so a larger block costs more to
+fill. There are no dirty bits or write-back behavior.
 
-## Validation
+## Validation and comparison
 
-The finite processor trace checks returned values and error codes with asserts.
-Both requests are issued before either response is awaited. Both caches must
-start at the issue timestamp; the pair finishes at the maximum of the two
-completion timestamps. The initial cold reads overlap rather than execute one
-after another. Read-hit latency must equal exactly CACHE_DELAY, including zero.
+The processor uses general names such as addresses, index, slot, way, and tag.
+Its 20-request trace checks returned data, stored-value persistence, instruction
+and data isolation, invalid alignment and range, hit/miss accounting, spatial
+hits, repeated hits, and exact hit delay. Both caches must start each pair at
+the issue timestamp; completion must equal the later cache completion time.
+Assertions must stay enabled, and a run must reach PASS.
 
-The trace tests repeated hits, a store followed by a load, a conflicting address
-that evicts the stored word, and a reload that verifies persistence in memory.
-Instruction reads must remain unchanged by data stores. Out-of-range and
-unaligned addresses must report errors. Consecutive zero-delay requests expose
-lost handshakes and stale responses. A finite trace avoids an infinite zero-time
-request loop. Keep assertions enabled and require the final PASS marker;
-reaching the simulator's time limit alone is not success.
+The comparison holds capacity at four 16-byte blocks and varies the layout:
+4 sets x 1 way (direct-mapped), 2 sets x 2 ways, and 1 set x 4 ways (fully
+associative). Addresses 0, 64, 128, and 192 intentionally map to one set in
+all three configurations. Greater associativity can retain more of those
+blocks, reducing conflict misses. This is a conflict-heavy trace, not a claim
+that every workload benefits equally. Random eviction results depend on the
+seed and request sequence.
 
-Test zero and nonzero delays independently, especially unequal cache and memory
-delays, to expose unintended coupling. The model uses four direct-mapped word
-lines and write-through, write-allocate stores. It intentionally omits block
-fills, dirty lines, coherence, and full instruction execution. Each pair waits
-for both results before issuing the next pair; concurrency is demonstrated
-within each pair. Configured processing delays are whole cycles, while shared
-communication can complete within one phase.
+The check script also tests cache/memory delays (2,0), (0,3), and (2,3),
+and block sizes 4 and 256. It builds temporary copies without modifying the
+working model and fails if compilation, assertions, or the PASS marker fail.
+
+Measured results with both configured delays zero (hits/misses per cache;
+two invalid requests excluded):
+
+| Sets | Ways | Hits | Misses | Completion cycle |
+| --- | --- | --- | --- | --- |
+| 4 | 1 | 4 | 14 | 114 |
+| 2 | 2 | 7 | 11 | 90 |
+| 1 | 4 | 14 | 4 | 34 |
+
+For the default two-way layout, delay pairs (2,0), (0,3), and (2,3)
+finish at cycles 130, 225, and 265 respectively, with unchanged hit counts.
+All eight tested configurations pass.
