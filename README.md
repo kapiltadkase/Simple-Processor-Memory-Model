@@ -25,7 +25,9 @@ Select each cache's policy in the Top init block before running:
 core.instruction_cache.replacement_policy = Cache<>::LRU;
 core.data_cache.replacement_policy = Cache<>::RANDOM;
 ```
-The existing random policy uses a fixed seed. FIFO is not implemented yet.
+Use `Cache<>::FIFO` to evict the block loaded earliest in each set.
+Read and write hits, including bypass reads, do not change FIFO order.
+The existing random policy uses a fixed seed.
 Rebuild after changing the setting.
 
 Each block holds bytes, a tag, a valid bit, and a dirty bit. A store hit updates

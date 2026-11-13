@@ -1,0 +1,43 @@
+// Fill 0 and 32, then touch 0: FIFO must still evict 0 when 64 arrives.
+// Touch 32 next: it must still be evicted when 96 arrives.
+procedure Processor
+    include $#include "Cache.h"$
+    decl $
+        Cache<>* instruction_cache = nullptr;
+        Cache<>* data_cache = nullptr;
+        int index = 0;
+        uint32_t addresses[7] = {0, 32, 0, 64, 32, 96, 0};
+        bool expected_hits[7] = {false, false, true, false, true, false, false};
+    $
+    behavior
+        do
+            $
+            data_cache->address = addresses[index];
+            data_cache->write = index <= 2;
+            data_cache->write_data = 100 + index;
+            data_cache->request_id++;
+            $;
+            wait until ($data_cache->request_id == data_cache->response_id$);
+            $
+            assert(data_cache->error == 0);
+            assert(data_cache->hit == expected_hits[index]);
+            if (index == 6) assert(data_cache->read_data == 102);
+            $;
+            // Extra read hits must not change which block FIFO removes next.
+            if (index == 2 or index == 4) then
+                $
+                data_cache->read_address = addresses[index];
+                data_cache->read_request++;
+                $;
+                wait until ($data_cache->read_request == data_cache->read_response$);
+                $assert(data_cache->read_error == 0 && data_cache->read_value == (index == 2 ? 102 : 101));$;
+            end if;
+            $index++;$;
+        while (index < 7) end do;
+        $
+        assert(data_cache->writebacks == 2);
+        log << endl << "PASS FIFO";
+        $;
+        stop simulation;
+    end behavior
+end procedure

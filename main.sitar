@@ -26,7 +26,8 @@ module Top
         // Delays control how long cache lookups and memory operations take.
         // To choose a policy here, use (then rebuild):
         // core.data_cache.replacement_policy = Cache<>::LRU;
-        // Use Cache<>::RANDOM for random eviction; instruction_cache works the same way.
+        // Use Cache<>::FIFO or Cache<>::RANDOM for the other policies.
+        // instruction_cache works the same way.
         core.instruction_cache.CACHE_DELAY = 0;
         core.data_cache.CACHE_DELAY = 0;
         instruction_memory.MEM_DELAY = 0;
@@ -77,8 +78,9 @@ procedure Cache
     $
     decl $
         // When a set is full, LRU removes its least recently used block.
+        // FIFO removes the block loaded first, even if it was used recently.
         // RANDOM picks a slot at random instead. Empty slots are always used first.
-        enum ReplacementPolicy { LRU, RANDOM };
+        enum ReplacementPolicy { LRU, RANDOM, FIFO };
         ReplacementPolicy replacement_policy = LRU;
         int CACHE_DELAY = 0;
 
@@ -137,9 +139,10 @@ procedure Cache
         // A fixed seed makes random replacement repeatable between simulation runs.
         std::mt19937 generator{1};
 
-        // LRU ranks: 0 means newest; larger numbers mean older. Each set has its own ranks.
+        // Replacement ranks: 0 means newest; larger numbers mean older, within each set.
+        // LRU updates them on every access; FIFO updates them only when loading a block.
         int recency[NUM_SETS][NUM_WAYS] = {};
-        // Move the accessed block to the front and shift the blocks that were newer.
+        // Move this block to the front and shift the blocks that were newer.
         void touch(int set, int accessed) {
             for (int i = 0; i < NUM_WAYS; i++)
                 if (valid[set][i] && i != accessed && recency[set][i] <= recency[set][accessed])
@@ -170,7 +173,7 @@ procedure Cache
         token<5> response_token;
     $
     behavior
-        $if ((replacement_policy != LRU && replacement_policy != RANDOM) || CACHE_DELAY < 0 || !memory_request || !memory_response)
+        $if ((replacement_policy != LRU && replacement_policy != RANDOM && replacement_policy != FIFO) || CACHE_DELAY < 0 || !memory_request || !memory_response)
             throw std::runtime_error("Invalid cache configuration");$;
         [
             do
@@ -290,8 +293,9 @@ procedure Cache
                         save_word(offset, saved_data);
                         dirty[slot][way]=true;
                     }
-                    // A successful access makes this block the most recently used.
-                    if (!error && replacement_policy == LRU) {
+                    // LRU refreshes the order on every successful access.
+                    // FIFO adds new blocks at the back of the queue; hits keep their place.
+                    if (!error && (replacement_policy == LRU || (replacement_policy == FIFO && !hit))) {
                         if (!hit) recency[slot][way] = NUM_WAYS;
                         touch(slot, way);
                     }

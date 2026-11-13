@@ -60,13 +60,15 @@ for delay in (0, 3):
     assert times[1] < times[0], times
     print(f'Concurrent reads save {times[0]-times[1]} ticks with memory_delay={delay}')
 
-# Touches through writes and the extra read slot must change the next victim.
-fixture = Path(__file__).with_name('lru.sitar').read_text()
-model = re.sub(r'procedure Processor\n.*?end procedure', lambda _: fixture, source, flags=re.S)
-with tempfile.TemporaryDirectory() as directory:
-    Path(directory, 'main.sitar').write_text(model)
-    for command in [['sitar', 'translate', 'main.sitar'], ['sitar', 'compile'], ['./sitar_sim', '10000']]:
-        result = subprocess.run(command, cwd=directory, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        assert result.returncode == 0 and 'FAILURE' not in result.stdout, result.stdout
-    assert 'PASS LRU' in result.stdout, result.stdout
-    print('PASS LRU: write/read recency and dirty eviction')
+# The same cache must honor access order for LRU and insertion order for FIFO.
+for policy in ("LRU", "FIFO"):
+    fixture = Path(__file__).with_name(f'{policy.lower()}.sitar').read_text()
+    model = re.sub(r'procedure Processor\n.*?end procedure', lambda _: fixture, source, flags=re.S)
+    model = model.replace('replacement_policy = LRU', f'replacement_policy = {policy}')
+    with tempfile.TemporaryDirectory() as directory:
+        Path(directory, 'main.sitar').write_text(model)
+        for command in [['sitar', 'translate', 'main.sitar'], ['sitar', 'compile'], ['./sitar_sim', '10000']]:
+            result = subprocess.run(command, cwd=directory, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            assert result.returncode == 0 and 'FAILURE' not in result.stdout, result.stdout
+        assert f'PASS {policy}' in result.stdout, result.stdout
+        print(f'PASS {policy}: replacement order and dirty eviction')
