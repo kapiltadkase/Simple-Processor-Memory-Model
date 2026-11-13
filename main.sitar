@@ -1,11 +1,19 @@
+// This file describes a simulated processor, two caches, and their memories.
+// Sitar controls timing and parallel work; code between $ markers is C++.
+// "wait" pauses a worker, and || separates workers that run alongside each other.
+
+// Top connects all the parts of the simulation.
 module Top
     submodule core : Core
     submodule instruction_memory : Memory
     submodule data_memory : Memory
+    // Each connection holds one message: a 9-byte request or a 5-byte reply.
     net instruction_request : capacity 1 width 9
     net instruction_response : capacity 1 width 5
     net data_request : capacity 1 width 9
     net data_response : capacity 1 width 5
+
+    // Give the instruction cache and data cache their own memory connections.
     core.instruction_request => instruction_request
     instruction_memory.request <= instruction_request
     instruction_memory.response => instruction_response
@@ -15,6 +23,10 @@ module Top
     data_memory.response => data_response
     core.data_response <= data_response
     init $
+        // Delays control how long cache lookups and memory operations take.
+        // To choose a policy here, use (then rebuild):
+        // core.data_cache.replacement_policy = Cache<>::LRU;
+        // Use Cache<>::RANDOM for random eviction; instruction_cache works the same way.
         core.instruction_cache.CACHE_DELAY = 0;
         core.data_cache.CACHE_DELAY = 0;
         instruction_memory.MEM_DELAY = 0;
@@ -22,6 +34,7 @@ module Top
     $
 end module
 
+// Core contains the processor and its two caches.
 module Core
     outport instruction_request : width 9
     inport instruction_response : width 5
@@ -31,6 +44,7 @@ module Core
     procedure instruction_cache : Cache<>
     procedure data_cache : Cache<>
     init $
+        // Tell each cache where to send requests and where to receive replies.
         instruction_cache.memory_request = &instruction_request;
         instruction_cache.memory_response = &instruction_response;
         data_cache.memory_request = &data_request;
@@ -39,11 +53,20 @@ module Core
         processor.data_cache = &data_cache;
     $
     behavior
-        [run processor; || run instruction_cache; || run data_cache;];
+        // All three keep running together; one waiting cache does not stop the other.
+        [
+            run processor;
+        ||
+            run instruction_cache;
+        ||
+            run data_cache;
+        ];
     end behavior
 end module
 
+// A cache keeps small blocks of memory nearby to avoid repeated memory trips.
 procedure Cache
+    // Sets are groups; ways are the block slots in each group. Block size is in bytes.
     parameter int NUM_SETS = 2
     parameter int NUM_WAYS = 2
     parameter int BLOCK_SIZE = 16
@@ -53,55 +76,93 @@ procedure Cache
         #include <random>
     $
     decl $
+        // When a set is full, LRU removes its least recently used block.
+        // RANDOM picks a slot at random instead. Empty slots are always used first.
+        enum ReplacementPolicy { LRU, RANDOM };
+        ReplacementPolicy replacement_policy = LRU;
         int CACHE_DELAY = 0;
-        // Disable bypass to compare with the blocking cache on the same workload.
+
+        // Set this to true to make extra reads wait while the cache is busy.
         bool BLOCKING = false;
-        // One ordinary request plus one read slot; drain both before issuing the next ordinary request.
-        // The memory worker runs first each phase; bypass hits need no memory arbitration.
+        // There is room for one ordinary request and one extra read.
+        // The caller must wait for both to finish before sending another ordinary request.
+        // busy means an ordinary request is active; writing means a write-back is active.
         bool busy = false, writing = false;
         uint64_t read_request = 0, read_response = 0, read_start = 0, read_finish = 0;
         uint32_t read_address = 0, read_value = 0;
         uint8_t read_error = 0;
         int read_slot, read_way, read_offset;
         uint64_t overlap_hits = 0;
+
+        // Find the extra read in the cache. -1 means it is missing or its address is invalid.
         int find_read() {
             if (read_address > 252 || read_address % 4) return -1;
             int set = (read_address / BLOCK_SIZE) % NUM_SETS;
-            for (int i=0; i<NUM_WAYS; i++)
+            for (int i = 0; i < NUM_WAYS; i++)
                 if (valid[set][i] && tags[set][i] == read_address / BLOCK_SIZE / NUM_SETS)
                     return i;
             return -1;
         }
+
+        // During write-back, an extra read may use another block already in the cache.
+        // It cannot read the block being evicted or start another memory transfer.
         bool can_read() {
             if (!busy) return true;
             if (BLOCKING || !writing) return false;
             int found = find_read();
             return found >= 0 && !((read_address / BLOCK_SIZE) % NUM_SETS == uint32_t(slot) && found == way);
         }
+
+        // Connections to memory, followed by the ordinary request and its result.
         outport<9>* memory_request = nullptr;
         inport<5>* memory_response = nullptr;
+        // A larger request number means new work; matching numbers mean it is done.
         uint64_t request_id = 0, response_id = 0;
         uint32_t address = 0, write_data = 0, read_data = 0;
         uint8_t write = 0, error = 0;
         uint64_t start_time = 0, finish_time = 0, hits = 0, misses = 0, writebacks = 0;
-        static_assert(NUM_SETS > 0 && !(NUM_SETS & (NUM_SETS-1)), "Invalid set count");
-        static_assert(NUM_WAYS > 0 && !(NUM_WAYS & (NUM_WAYS-1)), "Invalid way count");
-        static_assert(BLOCK_SIZE >= 4 && BLOCK_SIZE <= 256 && !(BLOCK_SIZE & (BLOCK_SIZE-1)), "Invalid block size");
+
+        // Reject cache dimensions that the address calculations cannot support.
+        static_assert(NUM_SETS > 0 && !(NUM_SETS & (NUM_SETS - 1)), "Invalid set count");
+        static_assert(NUM_WAYS > 0 && !(NUM_WAYS & (NUM_WAYS - 1)), "Invalid way count");
+        static_assert(BLOCK_SIZE >= 4 && BLOCK_SIZE <= 256 && !(BLOCK_SIZE & (BLOCK_SIZE - 1)), "Invalid block size");
+
+        // valid: this slot contains usable data. dirty: its data has changed since loading.
+        // A tag identifies which memory block is stored here; values holds its bytes.
         bool valid[NUM_SETS][NUM_WAYS] = {};
         bool dirty[NUM_SETS][NUM_WAYS] = {};
         uint32_t tags[NUM_SETS][NUM_WAYS] = {};
         uint8_t values[NUM_SETS][NUM_WAYS][BLOCK_SIZE] = {};
+
+        // A fixed seed makes random replacement repeatable between simulation runs.
         std::mt19937 generator{1};
+
+        // LRU ranks: 0 means newest; larger numbers mean older. Each set has its own ranks.
+        int recency[NUM_SETS][NUM_WAYS] = {};
+        // Move the accessed block to the front and shift the blocks that were newer.
+        void touch(int set, int accessed) {
+            for (int i = 0; i < NUM_WAYS; i++)
+                if (valid[set][i] && i != accessed && recency[set][i] <= recency[set][accessed])
+                    recency[set][i]++;
+            recency[set][accessed] = 0;
+        }
+
+        // Keep the active request safe while waiting for memory.
+        // slot is the set, way is the chosen block slot, and offset is the byte within it.
         uint32_t saved_address, saved_data, tag, base, victim_base;
         uint8_t saved_write;
         uint64_t active_id;
         int slot, way, offset, position;
+
+        // Split one 32-bit word into four bytes, most significant byte first.
         void save_word(int pos, uint32_t value) {
-            for (int i=0; i<4; i++) values[slot][way][pos+i] = value >> (24-8*i);
+            for (int i = 0; i < 4; i++) values[slot][way][pos+i] = value >> (24-8*i);
         }
+
+        // Join those four bytes back into a word.
         uint32_t load_word(int pos) {
             uint32_t value = 0;
-            for (int i=0; i<4; i++) value = (value << 8) | values[slot][way][pos+i];
+            for (int i = 0; i < 4; i++) value = (value << 8) | values[slot][way][pos+i];
             return value;
         }
         bool hit, sent;
@@ -109,122 +170,183 @@ procedure Cache
         token<5> response_token;
     $
     behavior
-        $if (CACHE_DELAY < 0 || !memory_request || !memory_response)
+        $if ((replacement_policy != LRU && replacement_policy != RANDOM) || CACHE_DELAY < 0 || !memory_request || !memory_response)
             throw std::runtime_error("Invalid cache configuration");$;
         [
-        do
-            wait until (request_id > response_id);
-            $
-            assert(request_id == response_id + 1);
-            busy = true;
-            active_id = request_id;
-            saved_address = address; saved_data = write_data; saved_write = write;
-            start_time = current_time.toUint64();
-            error = saved_write > 1 ? 3 : saved_address % 4 ? 2 : saved_address > 252 ? 1 : 0;
-            base = saved_address / BLOCK_SIZE * BLOCK_SIZE;
-            offset = saved_address % BLOCK_SIZE;
-            slot = (saved_address / BLOCK_SIZE) % NUM_SETS;
-            tag = saved_address / BLOCK_SIZE / NUM_SETS;
-            way = -1;
-            for (int i=0; i<NUM_WAYS; i++)
-                if (valid[slot][i] && tags[slot][i] == tag) way = i;
-            hit = !error && way >= 0;
-            if (!error && !hit) {
-                for (int i=0; i<NUM_WAYS; i++)
-                    if (!valid[slot][i]) { way=i; break; }
-                if (way < 0) way = std::uniform_int_distribution<int>(0, NUM_WAYS-1)(generator);
-                victim_base = (tags[slot][way] * NUM_SETS + slot) * BLOCK_SIZE;
-            }
-            read_data = 0;
-            if (!error) { if (hit) hits++; else misses++; }
-            $;
-            wait(CACHE_DELAY,0);
-            if (not error) then
-                if (not hit and $valid[slot][way] && dirty[slot][way]$) then
-                    $writing=true; position=0;
-                    log << endl << "WRITEBACK_START base=" << victim_base;$;
-                    do
-                        $sitar::pack(request_token, uint8_t(1), uint32_t(victim_base+position), load_word(position)); sent=false;$;
-                        do
-                            wait until (this_phase == 1);
-                            $sent = memory_request->push(request_token);$;
-                            if (not sent) then wait; end if;
-                        while (not sent) end do;
-                        wait until (this_phase == 0 and $memory_response->peek(response_token)$);
-                        $memory_response->pull(response_token); sitar::unpack(response_token, error, read_data);
-                        position+=4;$;
-                    while (not error and position < BLOCK_SIZE) end do;
-                    $writing=false;
-                    if (!error) {
-                        dirty[slot][way]=false;
-                        writebacks++;
-                        log << endl << "WRITEBACK base=" << victim_base << " bytes=" << BLOCK_SIZE;
-                    }$;
-                end if;
-                if (not error and not hit) then
-                    $valid[slot][way]=false; position=0;$;
-                    do
-                        $sitar::pack(request_token, uint8_t(0), uint32_t(base+position), uint32_t(0)); sent=false;$;
-                        do
-                            wait until (this_phase == 1);
-                            $sent = memory_request->push(request_token);$;
-                            if (not sent) then wait; end if;
-                        while (not sent) end do;
-                        wait until (this_phase == 0 and $memory_response->peek(response_token)$);
-                        $memory_response->pull(response_token); sitar::unpack(response_token, error, read_data);
-                        if (!error) save_word(position, read_data);
-                        position+=4;$;
-                    while (not error and position < BLOCK_SIZE) end do;
-                    $if (!error) { valid[slot][way]=true; tags[slot][way]=tag; dirty[slot][way]=false; }$;
-                end if;
-                $if (!error && saved_write) {
-                    save_word(offset, saved_data);
-                    dirty[slot][way]=true;
+            do
+                // 1. Wait for an ordinary request and remember its inputs.
+                wait until (request_id > response_id);
+                $
+                assert(request_id == response_id + 1);
+                busy = true;
+                active_id = request_id;
+                saved_address = address;
+                saved_data = write_data;
+                saved_write = write;
+                start_time = current_time.toUint64();
+                // Error codes: 0 = OK, 1 = outside memory, 2 = unaligned, 3 = invalid operation.
+                // Each word is four bytes, so valid addresses are 0, 4, ..., 252.
+                error = saved_write > 1 ? 3 : saved_address % 4 ? 2 : saved_address > 252 ? 1 : 0;
+
+                // 2. Work out which block, set, and byte the address refers to.
+                base = saved_address / BLOCK_SIZE * BLOCK_SIZE;
+                offset = saved_address % BLOCK_SIZE;
+                slot = (saved_address / BLOCK_SIZE) % NUM_SETS;
+                tag = saved_address / BLOCK_SIZE / NUM_SETS;
+
+                // A hit means the requested block is already in this set.
+                way = -1;
+                for (int i = 0; i < NUM_WAYS; i++)
+                    if (valid[slot][i] && tags[slot][i] == tag) way = i;
+                hit = !error && way >= 0;
+
+                // 3. On a miss, use an empty slot or choose a block to replace.
+                if (!error && !hit) {
+                    for (int i = 0; i < NUM_WAYS; i++)
+                        if (!valid[slot][i]) {
+                            way = i;
+                            break;
+                        }
+                    if (way < 0) {
+                        if (replacement_policy == RANDOM)
+                            way = std::uniform_int_distribution<int>(0, NUM_WAYS - 1)(generator);
+                        else {
+                            way = 0;
+                            for (int i = 1; i < NUM_WAYS; i++)
+                                if (recency[slot][i] > recency[slot][way]) way = i;
+                        }
+                    }
+                    // Remember where the old block belongs in memory before replacing it.
+                    victim_base = (tags[slot][way] * NUM_SETS + slot) * BLOCK_SIZE;
                 }
-                read_data = error ? 0 : load_word(offset);$;
-            end if;
-            $
-            finish_time = current_time.toUint64();
-            busy = false;
-            response_id = active_id;
-            log << endl << "ACCESS id=" << response_id << " address=" << saved_address
-                << " hit=" << hit << " write=" << int(saved_write)
-                << " error=" << int(error) << " ticks=" << finish_time-start_time;
-            $;
-        while (1) end do;
+                read_data = 0;
+                if (!error) {
+                    if (hit) hits++;
+                    else misses++;
+                }
+                $;
+                wait(CACHE_DELAY, 0);
+                if (not error) then
+                    // 4. Save a changed old block before throwing it away.
+                    // Transfer four bytes at a time and wait for each reply.
+                    if (not hit and $valid[slot][way] && dirty[slot][way]$) then
+                        $writing=true;
+                        position = 0;
+                        log << endl << "WRITEBACK_START base=" << victim_base;$;
+                        do
+                            $sitar::pack(request_token, uint8_t(1), uint32_t(victim_base+position), load_word(position));
+                            sent = false;$;
+                            do
+                                // Retry if the connection is full; send during phase 1.
+                                wait until (this_phase == 1);
+                                $sent = memory_request->push(request_token);$;
+                                if (not sent) then
+                                    wait;
+                                end if;
+                            while (not sent) end do;
+                            wait until (this_phase == 0 and $memory_response->peek(response_token)$);
+                            $memory_response->pull(response_token);
+                            sitar::unpack(response_token, error, read_data);
+                            position+=4;$;
+                        while (not error and position < BLOCK_SIZE) end do;
+                        $writing=false;
+                        if (!error) {
+                            dirty[slot][way]=false;
+                            writebacks++;
+                            log << endl << "WRITEBACK base=" << victim_base << " bytes=" << BLOCK_SIZE;
+                        }$;
+                    end if;
+
+                    // 5. Fetch the missing block. It becomes usable only after every word arrives.
+                    if (not error and not hit) then
+                        $valid[slot][way]=false;
+                        position = 0;$;
+                        do
+                            $sitar::pack(request_token, uint8_t(0), uint32_t(base+position), uint32_t(0));
+                            sent = false;$;
+                            do
+                                // Retry if the connection is full; send during phase 1.
+                                wait until (this_phase == 1);
+                                $sent = memory_request->push(request_token);$;
+                                if (not sent) then
+                                    wait;
+                                end if;
+                            while (not sent) end do;
+                            wait until (this_phase == 0 and $memory_response->peek(response_token)$);
+                            $memory_response->pull(response_token);
+                            sitar::unpack(response_token, error, read_data);
+                            if (!error) save_word(position, read_data);
+                            position+=4;$;
+                        while (not error and position < BLOCK_SIZE) end do;
+                        $if (!error) {
+                            valid[slot][way] = true;
+                            tags[slot][way] = tag;
+                            dirty[slot][way] = false;
+                        }$;
+                    end if;
+
+                    // 6. Apply a store to the cached copy and mark it for a later write-back.
+                    $if (!error && saved_write) {
+                        save_word(offset, saved_data);
+                        dirty[slot][way]=true;
+                    }
+                    // A successful access makes this block the most recently used.
+                    if (!error && replacement_policy == LRU) {
+                        if (!hit) recency[slot][way] = NUM_WAYS;
+                        touch(slot, way);
+                    }
+                    read_data = error ? 0 : load_word(offset);$;
+                end if;
+                $
+                // 7. Publish the result so the processor knows this request is finished.
+                finish_time = current_time.toUint64();
+                busy = false;
+                response_id = active_id;
+                log << endl << "ACCESS id=" << response_id << " address=" << saved_address
+                    << " hit=" << hit << " write=" << int(saved_write)
+                    << " error=" << int(error) << " ticks=" << finish_time-start_time;
+                $;
+            while (1) end do;
         ||
-        // One extra read can bypass a blocked request; memory traffic remains serialized.
-        do
-            wait until (read_request > read_response and $can_read()$);
-            $assert(read_request == read_response+1);
-            read_start=current_time.toUint64();
-            read_way=find_read();
-            read_slot=(read_address/BLOCK_SIZE)%NUM_SETS;
-            read_offset=read_address%BLOCK_SIZE;
-            read_error=read_address%4 ? 2 : read_address>252 ? 1 : 0;
-            read_value=0;
-            if (!read_error && read_way >= 0) {
-                for (int i=0; i<4; i++) read_value=(read_value<<8)|values[read_slot][read_way][read_offset+i];
-                hits++;
-                if (writing) overlap_hits++;
-            }$;
-            if (not read_error and read_way < 0) then
-                // A read miss uses the ordinary request path after its current owner completes.
-                wait until (not busy and request_id == response_id);
-                $address=read_address; write=0; request_id++;$;
-                wait until (request_id == response_id);
-                $read_value=read_data; read_error=error;$;
-            else
-                wait(CACHE_DELAY,0);
-            end if;
-            $read_finish=current_time.toUint64(); read_response=read_request;
-            log << endl << "READ_COMPLETE address=" << read_address << " value=" << read_value
-                << " writing=" << writing << " finish=" << current_time;$;
-        while (1) end do;
+            // Extra read worker: a cached read can proceed during write-back.
+            // During a fill, or when the read needs memory, it must wait.
+            do
+                wait until (read_request > read_response and $can_read()$);
+                $assert(read_request == read_response+1);
+                read_start = current_time.toUint64();
+                read_way = find_read();
+                read_slot = (read_address/BLOCK_SIZE)%NUM_SETS;
+                read_offset = read_address%BLOCK_SIZE;
+                read_error = read_address%4 ? 2 : read_address>252 ? 1 : 0;
+                read_value = 0;
+                if (!read_error && read_way >= 0) {
+                    for (int i = 0; i < 4; i++) read_value=(read_value<<8)|values[read_slot][read_way][read_offset+i];
+                    hits++;
+                    if (replacement_policy == LRU) touch(read_slot, read_way);
+                    if (writing) overlap_hits++;
+                }$;
+                if (not read_error and read_way < 0) then
+                    // This read is missing from the cache: let the ordinary worker fetch it.
+                    wait until (not busy and request_id == response_id);
+                    $address=read_address;
+                    write = 0;
+                    request_id++;$;
+                    wait until (request_id == response_id);
+                    $read_value=read_data;
+                    read_error = error;$;
+                else
+                    wait(CACHE_DELAY, 0);
+                end if;
+                $read_finish=current_time.toUint64();
+                read_response = read_request;
+                log << endl << "READ_COMPLETE address=" << read_address << " value=" << read_value
+                    << " writing=" << writing << " finish=" << current_time;$;
+            while (1) end do;
         ];
     end behavior
 end procedure
 
+// This processor is a test driver: it sends 20 requests and checks the answers.
 procedure Processor
     include $
         #include "Cache.h"
@@ -233,10 +355,14 @@ procedure Processor
     decl $
         Cache<>* instruction_cache = nullptr;
         Cache<>* data_cache = nullptr;
+        // Repeated addresses exercise hits and evictions; 256 and 2 check invalid inputs.
         const uint32_t addresses[20] = {0,4,0,0,64,0,256,2,128,192,0,64,128,192,0,64,128,192,0,4};
+        // A separate copy of expected memory lets us catch wrong or lost data.
         uint32_t expected[64];
         int index = 0;
         uint64_t issue_time;
+
+        // Send only when both request slots are free, and update the expected answer.
         void submit(Cache<>* cache, bool store) {
             assert(cache->request_id == cache->response_id);
             assert(cache->read_request == cache->read_response);
@@ -247,6 +373,8 @@ procedure Processor
                 expected[cache->address/4] = cache->write_data;
             cache->request_id++;
         }
+
+        // Check the returned data, errors, request counts, and timing.
         void check(Cache<>* cache, bool data_path) {
             uint8_t expected_error = index == 6 ? 1 : index == 7 ? 2 : 0;
             uint32_t expected_data = expected_error ? 0 :
@@ -260,10 +388,11 @@ procedure Processor
         }
     $
     behavior
-        $for (int i=0; i<64; i++) expected[i]=i;$;
+        $for (int i = 0; i < 64; i++) expected[i]=i;$;
         do
             $
             issue_time = current_time.toUint64();
+            // Read instructions every time; alternate data writes and reads.
             submit(instruction_cache, false);
             submit(data_cache, index % 2 == 0);
             $;
@@ -291,7 +420,8 @@ procedure Processor
     end behavior
 end procedure
 
-// A store response acknowledges the value actually written.
+// Memory holds 64 four-byte words (256 bytes total).
+// A store reply returns the value just written, so the cache can check completion.
 module Memory
     inport request : width 9
     outport response : width 5
@@ -304,25 +434,33 @@ module Memory
         token<9> request_token;
         token<5> response_token;
     $
-    init $for (int i=0; i<64; i++) words[i]=i;$
+    // Start with predictable data: word 0 contains 0, word 1 contains 1, and so on.
+    init $for (int i = 0; i < 64; i++) words[i]=i;$
     behavior
         $if (MEM_DELAY < 0) throw std::runtime_error("Negative memory delay");$;
         do
+            // Receive during phase 0, then wait out the configured memory delay.
             wait until (this_phase == 0 and $request.peek(request_token)$);
-            $request.pull(request_token); sitar::unpack(request_token, write, address, value);$;
-            wait(MEM_DELAY,0);
+            $request.pull(request_token);
+            sitar::unpack(request_token, write, address, value);$;
+            wait(MEM_DELAY, 0);
             $
+            // Validate before indexing memory; invalid requests return an error and zero.
             error = write > 1 ? 3 : address % 4 ? 2 : address > 252 ? 1 : 0;
             if (!error) {
                 if (write) words[address/4]=value;
-                value=words[address/4];
+                value = words[address/4];
             } else value=0;
-            sitar::pack(response_token, error, value); sent=false;
+            // Package the error code and value into a reply.
+            sitar::pack(response_token, error, value);
+            sent = false;
             $;
             do
                 wait until (this_phase == 1);
                 $sent=response.push(response_token);$;
-                if (not sent) then wait; end if;
+                if (not sent) then
+                    wait;
+                end if;
             while (not sent) end do;
         while (1) end do;
     end behavior

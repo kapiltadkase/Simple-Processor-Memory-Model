@@ -10,9 +10,9 @@ for sets, ways, block, cache_delay, memory_delay, mode in [
     (2, 2, 16, 2, 0, "mixed"), (2, 2, 16, 0, 3, "mixed"), (2, 2, 16, 2, 3, "mixed"),
     (2, 2, 4, 0, 0, "mixed"), (1, 1, 256, 0, 0, "mixed"),
     (2, 2, 16, 0, 0, "reads"), (2, 2, 16, 0, 0, "local"),
-    (2, 2, 16, 0, 0, "stream"),
+    (2, 2, 16, 0, 0, "stream"), (2, 2, 16, 0, 0, "random"),
 ]:
-    model = source
+    model = source.replace("replacement_policy = LRU", "replacement_policy = RANDOM") if mode == "random" else source
     for name, value in [('NUM_SETS', sets), ('NUM_WAYS', ways), ('BLOCK_SIZE', block)]:
         model = re.sub(rf'parameter int {name} = \d+', f'parameter int {name} = {value}', model)
     model = model.replace('.CACHE_DELAY = 0', f'.CACHE_DELAY = {cache_delay}')
@@ -59,3 +59,14 @@ for delay in (0, 3):
             print(f'blocking={blocking} memory_delay={delay}: ' + next(line for line in result.stdout.splitlines() if 'COMPARE ' in line))
     assert times[1] < times[0], times
     print(f'Concurrent reads save {times[0]-times[1]} ticks with memory_delay={delay}')
+
+# Touches through writes and the extra read slot must change the next victim.
+fixture = Path(__file__).with_name('lru.sitar').read_text()
+model = re.sub(r'procedure Processor\n.*?end procedure', lambda _: fixture, source, flags=re.S)
+with tempfile.TemporaryDirectory() as directory:
+    Path(directory, 'main.sitar').write_text(model)
+    for command in [['sitar', 'translate', 'main.sitar'], ['sitar', 'compile'], ['./sitar_sim', '10000']]:
+        result = subprocess.run(command, cwd=directory, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        assert result.returncode == 0 and 'FAILURE' not in result.stdout, result.stdout
+    assert 'PASS LRU' in result.stdout, result.stdout
+    print('PASS LRU: write/read recency and dirty eviction')

@@ -1,0 +1,31 @@
+procedure Processor
+    include $#include "Cache.h"$
+    decl $
+        Cache<>* instruction_cache = nullptr;
+        Cache<>* data_cache = nullptr;
+        int index = 0;
+        uint32_t addresses[7] = {0, 32, 0, 64, 96, 0, 32};
+        bool expected_hits[7] = {false, false, true, false, false, true, false};
+    $
+    behavior
+        do
+            $data_cache->address=addresses[index];
+            data_cache->write=index <= 2;
+            data_cache->write_data=100+index;
+            data_cache->request_id++;$;
+            wait until ($data_cache->request_id == data_cache->response_id$);
+            $assert(data_cache->error == 0);
+            assert(data_cache->hit == expected_hits[index]);
+            if (index == 6) assert(data_cache->read_data == 101);$;
+            if (index == 3) then
+                $data_cache->read_address=0; data_cache->read_request++;$;
+                wait until ($data_cache->read_request == data_cache->read_response$);
+                $assert(data_cache->read_error == 0 && data_cache->read_value == 102);$;
+            end if;
+            $index++;$;
+        while (index < 7) end do;
+        $assert(data_cache->writebacks == 1);
+        log << endl << "PASS LRU";$;
+        stop simulation;
+    end behavior
+end procedure

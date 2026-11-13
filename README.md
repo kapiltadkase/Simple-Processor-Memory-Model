@@ -16,8 +16,17 @@ memory limit supported block sizes to 4 through 256 bytes.
 
 For address a, offset = a % BLOCK_SIZE, set = (a / BLOCK_SIZE) % NUM_SETS,
 and tag = a / BLOCK_SIZE / NUM_SETS. Lookup searches only the selected set.
-A miss uses an invalid way first, otherwise a uniformly random victim from
-that set. A fixed seed makes the replacement sequence reproducible.
+A miss uses an invalid way first. Otherwise, LRU (the default) evicts the
+least recently accessed way in that set. Successful reads, writes, fills,
+and bypass reads update recency.
+
+Select each cache's policy in the Top init block before running:
+```cpp
+core.instruction_cache.replacement_policy = Cache<>::LRU;
+core.data_cache.replacement_policy = Cache<>::RANDOM;
+```
+The existing random policy uses a fixed seed. FIFO is not implemented yet.
+Rebuild after changing the setting.
 
 Each block holds bytes, a tag, a valid bit, and a dirty bit. A store hit updates
 cached bytes and sets dirty without accessing memory. A miss first writes a
@@ -65,7 +74,7 @@ Dirty resident blocks are not flushed when simulation stops. Reported counts
 measure eviction write-backs only; memory can legitimately lag cached data at
 termination. No coherence or non-blocking requests are modeled.
 
-All 11 checks pass. With the default layout and zero processing delays:
+Historical random-policy results with the default layout and zero processing delays:
 
 | Workload | Data hits | Data misses | Write-backs | Completion cycle |
 | --- | --- | --- | --- | --- |
