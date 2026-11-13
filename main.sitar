@@ -54,6 +54,30 @@ procedure Cache
     $
     decl $
         int CACHE_DELAY = 0;
+        // Disable bypass to compare with the blocking cache on the same workload.
+        bool BLOCKING = false;
+        // One ordinary request plus one read slot; drain both before issuing the next ordinary request.
+        // The memory worker runs first each phase; bypass hits need no memory arbitration.
+        bool busy = false, writing = false;
+        uint64_t read_request = 0, read_response = 0, read_start = 0, read_finish = 0;
+        uint32_t read_address = 0, read_value = 0;
+        uint8_t read_error = 0;
+        int read_slot, read_way, read_offset;
+        uint64_t overlap_hits = 0;
+        int find_read() {
+            if (read_address > 252 || read_address % 4) return -1;
+            int set = (read_address / BLOCK_SIZE) % NUM_SETS;
+            for (int i=0; i<NUM_WAYS; i++)
+                if (valid[set][i] && tags[set][i] == read_address / BLOCK_SIZE / NUM_SETS)
+                    return i;
+            return -1;
+        }
+        bool can_read() {
+            if (!busy) return true;
+            if (BLOCKING || !writing) return false;
+            int found = find_read();
+            return found >= 0 && !((read_address / BLOCK_SIZE) % NUM_SETS == uint32_t(slot) && found == way);
+        }
         outport<9>* memory_request = nullptr;
         inport<5>* memory_response = nullptr;
         uint64_t request_id = 0, response_id = 0;
@@ -87,10 +111,12 @@ procedure Cache
     behavior
         $if (CACHE_DELAY < 0 || !memory_request || !memory_response)
             throw std::runtime_error("Invalid cache configuration");$;
+        [
         do
             wait until (request_id > response_id);
             $
             assert(request_id == response_id + 1);
+            busy = true;
             active_id = request_id;
             saved_address = address; saved_data = write_data; saved_write = write;
             start_time = current_time.toUint64();
@@ -115,7 +141,8 @@ procedure Cache
             wait(CACHE_DELAY,0);
             if (not error) then
                 if (not hit and $valid[slot][way] && dirty[slot][way]$) then
-                    $position=0;$;
+                    $writing=true; position=0;
+                    log << endl << "WRITEBACK_START base=" << victim_base;$;
                     do
                         $sitar::pack(request_token, uint8_t(1), uint32_t(victim_base+position), load_word(position)); sent=false;$;
                         do
@@ -127,7 +154,8 @@ procedure Cache
                         $memory_response->pull(response_token); sitar::unpack(response_token, error, read_data);
                         position+=4;$;
                     while (not error and position < BLOCK_SIZE) end do;
-                    $if (!error) {
+                    $writing=false;
+                    if (!error) {
                         dirty[slot][way]=false;
                         writebacks++;
                         log << endl << "WRITEBACK base=" << victim_base << " bytes=" << BLOCK_SIZE;
@@ -157,12 +185,43 @@ procedure Cache
             end if;
             $
             finish_time = current_time.toUint64();
+            busy = false;
             response_id = active_id;
             log << endl << "ACCESS id=" << response_id << " address=" << saved_address
                 << " hit=" << hit << " write=" << int(saved_write)
                 << " error=" << int(error) << " ticks=" << finish_time-start_time;
             $;
         while (1) end do;
+        ||
+        // One extra read can bypass a blocked request; memory traffic remains serialized.
+        do
+            wait until (read_request > read_response and $can_read()$);
+            $assert(read_request == read_response+1);
+            read_start=current_time.toUint64();
+            read_way=find_read();
+            read_slot=(read_address/BLOCK_SIZE)%NUM_SETS;
+            read_offset=read_address%BLOCK_SIZE;
+            read_error=read_address%4 ? 2 : read_address>252 ? 1 : 0;
+            read_value=0;
+            if (!read_error && read_way >= 0) {
+                for (int i=0; i<4; i++) read_value=(read_value<<8)|values[read_slot][read_way][read_offset+i];
+                hits++;
+                if (writing) overlap_hits++;
+            }$;
+            if (not read_error and read_way < 0) then
+                // A read miss uses the ordinary request path after its current owner completes.
+                wait until (not busy and request_id == response_id);
+                $address=read_address; write=0; request_id++;$;
+                wait until (request_id == response_id);
+                $read_value=read_data; read_error=error;$;
+            else
+                wait(CACHE_DELAY,0);
+            end if;
+            $read_finish=current_time.toUint64(); read_response=read_request;
+            log << endl << "READ_COMPLETE address=" << read_address << " value=" << read_value
+                << " writing=" << writing << " finish=" << current_time;$;
+        while (1) end do;
+        ];
     end behavior
 end procedure
 
@@ -180,6 +239,7 @@ procedure Processor
         uint64_t issue_time;
         void submit(Cache<>* cache, bool store) {
             assert(cache->request_id == cache->response_id);
+            assert(cache->read_request == cache->read_response);
             cache->address = addresses[index];
             cache->write = store;
             cache->write_data = 777 + index;

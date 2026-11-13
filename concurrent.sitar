@@ -1,0 +1,63 @@
+procedure Processor
+    include $#include "Cache.h"$
+    decl $
+        Cache<>* instruction_cache = nullptr;
+        Cache<>* data_cache = nullptr;
+        int index=0, count=0;
+        uint64_t begin, elapsed;
+        void submit(uint32_t address, uint32_t value) {
+            assert(data_cache->request_id == data_cache->response_id);
+            assert(data_cache->read_request == data_cache->read_response);
+            data_cache->address=address; data_cache->write=1;
+            data_cache->write_data=value; data_cache->request_id++;
+        }
+        void read(uint32_t address) {
+            assert(data_cache->read_request == data_cache->read_response);
+            data_cache->read_address=address; data_cache->read_request++;
+        }
+    $
+    behavior
+        $submit(0, 100);$;
+        wait until ($data_cache->request_id == data_cache->response_id$);
+        $submit(16, 200);$;
+        wait until ($data_cache->request_id == data_cache->response_id$);
+        $begin=current_time.toUint64();$;
+        do
+            $submit(index%2 == 0 ? 32 : 0, 300+index);$;
+            wait until ($data_cache->writing$);
+            [
+                wait until ($data_cache->request_id == data_cache->response_id$);
+            ||
+                $count=0;$;
+                do
+                    $read(16);$;
+                    wait until ($data_cache->read_request == data_cache->read_response$);
+                    $assert(data_cache->read_error == 0 && data_cache->read_value == 200);$;
+                    wait(1,0);
+                    $count++;$;
+                while (count < 12) end do;
+            ];
+            $index++;$;
+        while (index < 4) end do;
+        $elapsed=current_time.toUint64()-begin;
+        assert(data_cache->writebacks == 4);
+        assert(data_cache->BLOCKING ? data_cache->overlap_hits == 0 : data_cache->overlap_hits > 0);
+        log << endl << "COMPARE ticks=" << elapsed << " overlap_hits=" << data_cache->overlap_hits;$;
+        // A victim read must wait for eviction, then reload the preserved data.
+        $submit(32, 999);$;
+        wait until ($data_cache->writing$);
+        $read(0);$;
+        wait until ($data_cache->read_request == data_cache->read_response$);
+        $assert(!data_cache->writing);
+        assert(data_cache->read_error == 0 && data_cache->read_value == 303);$;
+        // An unrelated miss also waits, then fetches through the one memory port.
+        $read(64);$;
+        wait until ($data_cache->read_request == data_cache->read_response$);
+        $assert(data_cache->read_error == 0 && data_cache->read_value == 16);$;
+        $read(2);$;
+        wait until ($data_cache->read_request == data_cache->read_response$);
+        $assert(data_cache->read_error == 2);
+        log << endl << "PASS concurrent";$;
+        stop simulation;
+    end behavior
+end procedure

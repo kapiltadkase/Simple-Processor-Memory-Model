@@ -39,3 +39,23 @@ for sets, ways, block, cache_delay, memory_delay, mode in [
         if mode == "stream":
             assert count > 0, summary
         print(f'mode={mode} sets={sets} ways={ways} block={block} cache_delay={cache_delay} memory_delay={memory_delay}: {summary}')
+
+# The same workload and memory schedule, with read bypass enabled or disabled.
+fixture = Path(__file__).with_name('concurrent.sitar').read_text()
+for delay in (0, 3):
+    times = []
+    for blocking in (True, False):
+        model = re.sub(r'procedure Processor\n.*?end procedure', lambda _: fixture, source, flags=re.S)
+        model = model.replace('parameter int NUM_WAYS = 2', 'parameter int NUM_WAYS = 1')
+        model = model.replace('bool BLOCKING = false', f'bool BLOCKING = {str(blocking).lower()}')
+        model = model.replace('.MEM_DELAY = 0', f'.MEM_DELAY = {delay}')
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory, 'main.sitar').write_text(model)
+            for command in [['sitar', 'translate', 'main.sitar'], ['sitar', 'compile'], ['./sitar_sim', '10000']]:
+                result = subprocess.run(command, cwd=directory, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                assert result.returncode == 0 and 'FAILURE' not in result.stdout and 'error ' not in result.stdout, result.stdout
+            assert 'PASS concurrent' in result.stdout, result.stdout
+            times.append(int(re.search(r'COMPARE ticks=(\d+)', result.stdout)[1]))
+            print(f'blocking={blocking} memory_delay={delay}: ' + next(line for line in result.stdout.splitlines() if 'COMPARE ' in line))
+    assert times[1] < times[0], times
+    print(f'Concurrent reads save {times[0]-times[1]} ticks with memory_delay={delay}')
