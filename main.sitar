@@ -142,7 +142,7 @@ procedure Cache
         // Replacement ranks: 0 means newest; larger numbers mean older, within each set.
         // LRU updates them on every access; FIFO updates them only when loading a block.
         int recency[NUM_SETS][NUM_WAYS] = {};
-        // Move this block to the front and shift the blocks that were newer.
+        // LRU / FIFO shared helper: mark this block newest and age the blocks that were newer.
         void touch(int set, int accessed) {
             for (int i = 0; i < NUM_WAYS; i++)
                 if (valid[set][i] && i != accessed && recency[set][i] <= recency[set][accessed])
@@ -211,9 +211,11 @@ procedure Cache
                             break;
                         }
                     if (way < 0) {
+                        // RANDOM replacement: evict a uniformly random way when the set is full.
                         if (replacement_policy == RANDOM)
                             way = std::uniform_int_distribution<int>(0, NUM_WAYS - 1)(generator);
                         else {
+                            // LRU / FIFO replacement: evict the largest rank (oldest use / oldest insertion).
                             way = 0;
                             for (int i = 1; i < NUM_WAYS; i++)
                                 if (recency[slot][i] > recency[slot][way]) way = i;
@@ -293,8 +295,8 @@ procedure Cache
                         save_word(offset, saved_data);
                         dirty[slot][way]=true;
                     }
-                    // LRU refreshes the order on every successful access.
-                    // FIFO adds new blocks at the back of the queue; hits keep their place.
+                    // LRU policy: update ranks on every successful access, including hits.
+                    // FIFO policy: update ranks only on insertion (a miss); hits keep their place.
                     if (!error && (replacement_policy == LRU || (replacement_policy == FIFO && !hit))) {
                         if (!hit) recency[slot][way] = NUM_WAYS;
                         touch(slot, way);
@@ -326,6 +328,7 @@ procedure Cache
                 if (!read_error && read_way >= 0) {
                     for (int i = 0; i < 4; i++) read_value=(read_value<<8)|values[read_slot][read_way][read_offset+i];
                     hits++;
+                    // LRU policy for extra read hits: refresh recency; FIFO keeps insertion order.
                     if (replacement_policy == LRU) touch(read_slot, read_way);
                     if (writing) overlap_hits++;
                 }$;
