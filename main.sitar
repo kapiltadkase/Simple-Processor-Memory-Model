@@ -1,4 +1,4 @@
-// Two independent cores, each with private instruction/data caches and memories.
+// Two cores with private caches and a shared data memory.
 // Sitar controls timing and parallel work; code between $ markers is C++.
 // "wait" pauses a worker, and || separates workers that run alongside each other.
 
@@ -13,32 +13,38 @@ module Top
     net data_request : capacity 1 width 10
     net data_response : capacity 1 width 5
 
-    // Give the instruction cache and data cache their own memory connections.
+    // Instruction requests stay private; data requests pass through the arbiter.
     core.instruction_request => instruction_request
     instruction_memory.request <= instruction_request
     instruction_memory.response => instruction_response
     core.instruction_response <= instruction_response
     core.data_request => data_request
-    data_memory.request <= data_request
-    data_memory.response => data_response
+    arbiter.request0 <= data_request
+    arbiter.response0 => data_response
     core.data_response <= data_response
     submodule core1 : Core
     submodule instruction_memory1 : Memory
-    submodule data_memory1 : Memory
+    submodule arbiter : Arbiter
+    net shared_request : capacity 1 width 10
+    net shared_response : capacity 1 width 5
+    arbiter.memory_request => shared_request
+    data_memory.request <= shared_request
+    data_memory.response => shared_response
+    arbiter.memory_response <= shared_response
     // Each connection holds one message: a 10-byte request or a 5-byte reply.
     net instruction_request1 : capacity 1 width 10
     net instruction_response1 : capacity 1 width 5
     net data_request1 : capacity 1 width 10
     net data_response1 : capacity 1 width 5
 
-    // Give the instruction cache and data cache their own memory connections.
+    // Instruction requests stay private; data requests pass through the arbiter.
     core1.instruction_request => instruction_request1
     instruction_memory1.request <= instruction_request1
     instruction_memory1.response => instruction_response1
     core1.instruction_response <= instruction_response1
     core1.data_request => data_request1
-    data_memory1.request <= data_request1
-    data_memory1.response => data_response1
+    arbiter.request1 <= data_request1
+    arbiter.response1 => data_response1
     core1.data_response <= data_response1
     init $
         core.instruction_cache.core_id = 0;
@@ -46,11 +52,12 @@ module Top
         core1.instruction_cache.core_id = 1;
         core1.data_cache.core_id = 1;
         instruction_memory1.core_id = 1;
-        data_memory1.core_id = 1;
+        core.processor.peer_done = &core1.processor.done;
+        core1.processor.peer_done = &core.processor.done;
         core1.instruction_cache.CACHE_DELAY = 1;
         core1.data_cache.CACHE_DELAY = 1;
         instruction_memory1.MEM_DELAY = 1;
-        data_memory1.MEM_DELAY = 1;
+
         // Delays control how long cache lookups and memory operations take.
         // To choose a policy here, use (then rebuild):
         // core.data_cache.replacement_policy = Cache<>::LRU;
@@ -387,79 +394,34 @@ procedure Cache
     end behavior
 end procedure
 
-// This processor is a test driver: it sends 20 requests and checks the answers.
+// Shared-memory test: evict cached copies before checking another core's store.
 procedure Processor
-    include $
-        #include "Cache.h"
-        #include <algorithm>
-    $
+    include $#include "Cache.h"$
     decl $
         Cache<>* instruction_cache = nullptr;
         Cache<>* data_cache = nullptr;
-        // Repeated addresses exercise hits and evictions; 256 and 2 check invalid inputs.
-        const uint32_t addresses[20] = {0,4,0,0,64,0,256,2,128,192,0,64,128,192,0,64,128,192,0,4};
-        // A separate copy of expected memory lets us catch wrong or lost data.
-        uint32_t expected[64];
         bool done = false;
+        bool* peer_done = nullptr;
         int index = 0;
-        uint64_t issue_time;
-
-        // Send only when both request slots are free, and update the expected answer.
-        void submit(Cache<>* cache, bool store) {
-            assert(cache->request_id == cache->response_id);
-            assert(cache->read_request == cache->read_response);
-            cache->address = addresses[index];
-            cache->write = store;
-            cache->write_data = 777 + index + 1000 * cache->core_id;
-            if (store && cache->address <= 252 && cache->address % 4 == 0)
-                expected[cache->address/4] = cache->write_data;
-            cache->request_id++;
-        }
-
-        // Check the returned data, errors, request counts, and timing.
-        void check(Cache<>* cache, bool data_path) {
-            uint8_t expected_error = index == 6 ? 1 : index == 7 ? 2 : 0;
-            uint32_t expected_data = expected_error ? 0 :
-                data_path ? expected[addresses[index]/4] : addresses[index]/4;
-            assert(cache->response_id == uint64_t(index+1));
-            assert(cache->hits + cache->misses == uint64_t(index+1 - (index >= 6) - (index >= 7)));
-            assert(cache->start_time == issue_time);
-            assert(cache->error == expected_error && cache->read_data == expected_data);
-            if (!expected_error && cache->hit)
-                assert(cache->finish_time-issue_time == uint64_t(2*cache->CACHE_DELAY));
-        }
+        uint32_t addresses[7] = {0,32,64,0,32,64,0};
     $
     behavior
-        $for (int i = 0; i < 64; i++) expected[i]=i;$;
         do
-            $
-            issue_time = current_time.toUint64();
-            // Read instructions every time; alternate data writes and reads.
-            submit(instruction_cache, false);
-            submit(data_cache, index % 2 == 0);
-            $;
-            [
-                wait until ($instruction_cache->response_id == instruction_cache->request_id$);
-                $check(instruction_cache, false);$;
-            ||
-                wait until ($data_cache->response_id == data_cache->request_id$);
-                $check(data_cache, true);$;
-            ];
-            $
-            assert(current_time.toUint64() == std::max(instruction_cache->finish_time, data_cache->finish_time));
-            log << endl << "PAIR index=" << index << " start=" << time(issue_time)
-                << " finish=" << current_time;
-            index++;
-            $;
-        while (index < 20) end do;
-        $log << endl << "PASS requests_per_cache=" << index
-            << " hits=" << instruction_cache->hits << " misses=" << instruction_cache->misses
-            << " data_hits=" << data_cache->hits << " data_misses=" << data_cache->misses
-            << " writebacks=" << data_cache->writebacks
-            << " core=" << int(data_cache->core_id)
-            << " instruction_writebacks=" << instruction_cache->writebacks
-            << " finish=" << current_time;$;
-        $done = true;$;
+            if (index == 3 and $data_cache->core_id == 1$) then
+                wait until ($*peer_done$);
+            end if;
+            $data_cache->address = addresses[index];
+            data_cache->write = index == 3 && data_cache->core_id == 0;
+            data_cache->write_data = 12345;
+            data_cache->request_id++;$;
+            wait until ($data_cache->request_id == data_cache->response_id$);
+            $assert(data_cache->error == 0);
+            assert(data_cache->read_data == (addresses[index] == 0 && index >= 3 ? 12345 : addresses[index]/4));
+            index++;$;
+        while (index < 7) end do;
+        $assert(data_cache->core_id == 1 || data_cache->writebacks == 1);
+        log << endl << "PASS shared core=" << int(data_cache->core_id);
+        done = true;$;
     end behavior
 end procedure
 
@@ -490,7 +452,7 @@ module Memory
             wait until (this_phase == 0 and $request.peek(request_token)$);
             $request.pull(request_token);
             sitar::unpack(request_token, request_core, write, address, value);
-            assert(request_core == core_id);$;
+            assert(request_core < 2);$;
             wait(MEM_DELAY, 0);
             $
             // Validate before indexing memory; invalid requests return an error and zero.
@@ -506,6 +468,50 @@ module Memory
             do
                 wait until (this_phase == 1);
                 $sent=response.push(response_token);$;
+                if (not sent) then
+                    wait;
+                end if;
+            while (not sent) end do;
+        while (1) end do;
+    end behavior
+end module
+
+// One outstanding word transaction; remember its owner until its reply is delivered.
+module Arbiter
+    inport request0 : width 10
+    inport request1 : width 10
+    outport response0 : width 5
+    outport response1 : width 5
+    outport memory_request : width 10
+    inport memory_response : width 5
+    decl $
+        token<10> request_token;
+        token<5> response_token;
+        bool ready0, ready1, sent;
+        int owner, next = 0;
+    $
+    behavior
+        do
+            wait until (this_phase == 0 and $(request0.peek(request_token) || request1.peek(request_token))$);
+            $ready0 = request0.peek(request_token);
+            ready1 = request1.peek(request_token);
+            owner = ready0 && ready1 ? next : ready0 ? 0 : 1;
+            if (owner == 0) request0.pull(request_token);
+            else request1.pull(request_token);
+            next = 1-owner;
+            sent = false;$;
+            do
+                wait until (this_phase == 1);
+                $sent = memory_request.push(request_token);$;
+                if (not sent) then
+                    wait;
+                end if;
+            while (not sent) end do;
+            wait until (this_phase == 0 and $memory_response.peek(response_token)$);
+            $memory_response.pull(response_token); sent = false;$;
+            do
+                wait until (this_phase == 1);
+                $sent = owner == 0 ? response0.push(response_token) : response1.push(response_token);$;
                 if (not sent) then
                     wait;
                 end if;

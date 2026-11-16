@@ -1,10 +1,13 @@
-"""Compare equal-capacity caches and check independent processing delays."""
+"""Check cache regressions and shared two-core backing memory."""
 from pathlib import Path
 import re
 import subprocess
 import tempfile
 
-source = Path(__file__).with_name('main.sitar').read_text()
+shared_source = Path(__file__).with_name('main.sitar').read_text()
+source = re.sub(r'procedure Processor\n.*?end procedure', lambda _: Path(__file__).with_name('mixed.sitar').read_text(), shared_source, flags=re.S)
+source = re.sub(r'^.*peer_done.*\n', '', source, flags=re.M)
+source = source.replace('run processor;', 'if ($data_cache.core_id == 0$) then run processor; else $processor.done = true;$; end if;')
 for sets, ways, block, cache_delay, memory_delay, mode in [
     (4, 1, 16, 0, 0, "mixed"), (2, 2, 16, 0, 0, "mixed"), (1, 4, 16, 0, 0, "mixed"),
     (2, 2, 16, 2, 0, "mixed"), (2, 2, 16, 0, 3, "mixed"), (2, 2, 16, 2, 3, "mixed"),
@@ -31,8 +34,8 @@ for sets, ways, block, cache_delay, memory_delay, mode in [
             result = subprocess.run(command, cwd=directory, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
             assert result.returncode == 0 and 'FAILURE' not in result.stdout, result.stdout
         assert 'PASS two_cores=2' in result.stdout, result.stdout
-        assert result.stdout.count('PASS requests_per_cache=20') == 2, result.stdout
-        assert ' core=0 ' in result.stdout and ' core=1 ' in result.stdout, result.stdout
+        assert result.stdout.count('PASS requests_per_cache=20') == 1, result.stdout
+        assert ' core=0 ' in result.stdout, result.stdout
         summary = next(line.split('PASS ')[1] for line in result.stdout.splitlines() if 'PASS ' in line)
         count = int(re.search(r' writebacks=(\d+)', summary)[1])
         assert 'instruction_writebacks=0' in summary
@@ -74,3 +77,13 @@ for policy in ("LRU", "FIFO"):
             assert result.returncode == 0 and 'FAILURE' not in result.stdout, result.stdout
         assert f'PASS {policy}' in result.stdout, result.stdout
         print(f'PASS {policy}: replacement order and dirty eviction')
+
+# Both private caches read one physical address; core 1 observes core 0's eviction.
+for delay in (0, 3):
+    with tempfile.TemporaryDirectory() as directory:
+        Path(directory, 'main.sitar').write_text(shared_source.replace('.MEM_DELAY = 0', f'.MEM_DELAY = {delay}'))
+        for command in [['sitar', 'translate', 'main.sitar'], ['sitar', 'compile'], ['./sitar_sim', '10000']]:
+            result = subprocess.run(command, cwd=directory, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            assert result.returncode == 0 and 'FAILURE' not in result.stdout, result.stdout
+        assert 'PASS shared core=0' in result.stdout and 'PASS shared core=1' in result.stdout, result.stdout
+        print(f'PASS shared memory delay={delay}')

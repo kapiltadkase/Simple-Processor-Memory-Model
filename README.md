@@ -1,117 +1,58 @@
-# Two-core write-back caches
+# Two-core shared data memory
 
-Build with `sitar translate main.sitar`, then `sitar compile`.
-Run `./sitar_sim 1000`; require two `PASS requests_per_cache=20` lines
-(one each for `core=0` and `core=1`) followed by `PASS two_cores=2`.
-Run `python3 check.py` for the configuration and workload checks.
+Build with `sitar translate main.sitar`, then `sitar compile`; run
+`./sitar_sim 1000`. Expect `PASS shared core=0`, `PASS shared core=1`,
+and `PASS two_cores=2`. Run `python3 check.py` for regressions.
 
-Top instantiates Core 0 (`core`) and Core 1 (`core1`). Each runs its own
-processor and private instruction/data Cache procedures concurrently. Each cache has
-its own external memory. Shared request/response sequence numbers allow one
-outstanding request per cache and same-phase completion for zero-delay hits.
-External memory reads occur in phase 0 and writes in phase 1.
+Each core has private instruction and data caches. Both data caches use exactly
+one `data_memory : Memory`, containing 64 four-byte words. Instruction memories
+remain private and separate from the shared data address space.
 
-NUM_SETS, NUM_WAYS, and BLOCK_SIZE are structural template parameters; edit
-their defaults in main.sitar and rebuild. All must be powers of two. The default
-is two sets, two ways, and 16-byte blocks. Aligned 32-bit accesses and a 256-byte
-memory limit supported block sizes to 4 through 256 bytes.
+Request flow:
 
-For address a, offset = a % BLOCK_SIZE, set = (a / BLOCK_SIZE) % NUM_SETS,
-and tag = a / BLOCK_SIZE / NUM_SETS. Lookup searches only the selected set.
-A miss uses an invalid way first. Otherwise, LRU (the default) evicts the
-least recently accessed way in that set. Successful reads, writes, fills,
-and bypass reads update recency.
-
-Select each cache's policy in the Top init block before running:
-```cpp
-core.instruction_cache.replacement_policy = Cache<>::LRU;
-core.data_cache.replacement_policy = Cache<>::RANDOM;
-```
-Use `Cache<>::FIFO` to evict the block loaded earliest in each set.
-Read and write hits, including bypass reads, do not change FIFO order.
-The existing random policy uses a fixed seed.
-Rebuild after changing the setting.
-
-Each block holds bytes, a tag, a valid bit, and a dirty bit. A store hit updates
-cached bytes and sets dirty without accessing memory. A miss first writes a
-valid dirty victim's entire block to its original memory address. Only after
-all writes succeed does it clear dirty and increment writebacks. It then
-fetches the requested block, installs it clean, and performs the original
-load or store. A store miss therefore leaves the newly allocated block dirty.
-Data words are assembled and split in big-endian order.
-
-Write-back and fill use serialized word transfers through the existing memory
-interface. Each word incurs MEM_DELAY plus net transport delay; writing a full
-block costs the same transfer time as reading a full block. Every cache request
-also pays CACHE_DELAY. Both delays are initialized independently in Top.
-The cache blocks during eviction and fill. The other cache can still proceed.
-Failed write-back preserves the victim's valid and dirty state; failed fills
-are never installed as valid.
-
-## Validation
-
-The 20-request mixed trace uses an independent array of expected data. It checks
-loads and stores, dirty-data persistence across eviction/reload, instruction
-memory isolation, invalid addresses, request accounting, concurrent start
-and completion, and exact hit latency for both loads and stores. Store values
-change with each request, making stale data visible. The final log reports
-hits, misses, and block write-backs. Assertions must remain enabled.
-
-check.py runs the mixed trace with direct-mapped, two-way, and fully associative
-layouts, independent zero/nonzero delays, and block sizes 4 and 256. It also
-runs three controlled workload boundaries with the default layout:
-
-- No stores: write-backs must remain zero.
-- Frequent stores within one block: high temporal and spatial locality keep
-  dirty data resident, so eviction write-backs remain zero.
-- Frequent stores across the memory: low locality exceeds cache capacity,
-  forcing dirty evictions. This trace also accesses different sets; the mixed
-  trace checks stored-value persistence with subsequent loads.
-
-These deterministic workloads represent store-frequency and locality extremes;
-they do not implement a probabilistic P_STORE or locality sweep. More stores
-can create more dirty victims, but repeated stores to a resident block combine
-into one eventual block write-back. Low locality causes more evictions and
-therefore more write-backs when the evicted blocks are dirty.
-
-Dirty resident blocks are not flushed when simulation stops. Reported counts
-measure eviction write-backs only; memory can legitimately lag cached data at
-termination. No coherence or non-blocking requests are modeled.
-
-Historical random-policy results with the default layout and zero processing delays:
-
-| Workload | Data hits | Data misses | Write-backs | Completion cycle |
-| --- | --- | --- | --- | --- |
-| No stores | 7 | 11 | 0 | 88 |
-| Local stores | 17 | 1 | 0 | 8 |
-| Streaming stores | 0 | 18 | 14 | 256 |
-| Mixed | 7 | 11 | 6 | 136 |
-
-The mixed trace takes 168 cycles with 7 write-backs for four sets/one way,
-and 32 cycles with no write-backs for one set/four ways. For the default
-layout, delay pairs (2,0), (0,3), and (2,3) finish at cycles 176, 340, and
-380, all with six write-backs. Instruction-cache write-backs are zero in
-every run because instruction requests are reads only.
-
-## Two-core test
-
-```sh
-sitar translate main.sitar
-sitar compile
-./sitar_sim 1000
-python3 check.py
+```text
+core.data_cache  -> data_request  -> arbiter.request0 ─┐
+                                                    ├-> shared_request -> data_memory
+core1.data_cache -> data_request1 -> arbiter.request1 ─┘
 ```
 
-Both processors independently run the checked 20-request trace. Core 1 uses
-store values offset by 1000 and nonzero delays, checking private state and
-allowing Core 0 to finish earlier. Top waits for both processors before stopping.
-Each private cache interface carries its fixed `core_id`; all downstream fill
-and write-back requests serialize this ID as the first byte (10 bytes total).
-Memory validates the originating ID. Responses keep the existing 5-byte format
-because each cache has a dedicated response connection.
+Both cores use identical physical byte addresses (0 through 255), without any
+core-specific translation or offset. Aligned word addresses range from 0 to 252.
+Requests carry core ID, operation, address and value in 10 bytes. Memory validates
+operation, alignment and bounds and returns a 5-byte error/value response.
 
-Configure Core 1 through `core1.data_cache`, `core1.instruction_cache`,
-`data_memory1`, and `instruction_memory1` in Top, just like Core 0.
-The existing write-back/write-allocate and LRU/FIFO/RANDOM policies are unchanged.
-Backing memories remain separate per cache, as in the original model; this is
-not a shared-memory multicore model. No MESI or coherence messages are modeled.
+The arbiter samples available requests in phase 0. If both are ready, it grants
+round-robin priority, initially core 0; after each grant priority switches to the
+other core. It forwards the unchanged request in phase 1 and waits for memory's
+reply before accepting another request. It remembers the owner and routes the
+reply from `shared_response` to only `data_response` or `data_response1`.
+Full output nets are retried. This serializes individual word transactions,
+including write acknowledgments and errors, with deterministic arbitration.
+A whole block transfer is not atomic: words from different cores may interleave.
+
+Caches retain write-back/write-allocate behavior and LRU, FIFO and RANDOM
+replacement. A dirty eviction writes all words of the victim block before filling
+the new block. Each word waits for its response. Cache hits remain private;
+shared memory arbitration only applies to fills and write-backs. Configure cache
+and memory delays in Top. NUM_SETS, NUM_WAYS and BLOCK_SIZE are structural
+parameters; defaults are two sets, two ways and 16-byte blocks.
+
+No MESI transitions, snooping or invalidations are implemented. A store can remain
+in a dirty cache until eviction, and another cache can retain a stale copy.
+Dirty lines are not automatically flushed at termination.
+
+## Tests
+
+The default two-core driver first reads address 0 from both caches, then evicts
+that clean line using addresses 32 and 64. Core 0 stores 12345 at address 0 and
+forces a dirty eviction. Core 1 waits for core 0 to finish and reads address 0
+again through a cache miss, asserting that it sees 12345. Both processors check
+every returned value and error, including different word values from the same
+shared memory. This demonstrates shared backing storage without assuming
+coherence. The test uses the default cache geometry and LRU policy.
+
+`check.py` runs this shared test with zero and nonzero memory delays. It also
+retains the earlier mixed, locality, streaming, replacement-policy and concurrent
+read tests, using only core 0 for those independent-memory oracle workloads.
+Those regressions exercise multiple cache geometries and delays, invalid inputs,
+dirty eviction, read bypass and exact hit latency. Assertions must stay enabled.

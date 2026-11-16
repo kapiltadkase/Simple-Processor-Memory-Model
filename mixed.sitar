@@ -1,0 +1,74 @@
+procedure Processor
+    include $
+        #include "Cache.h"
+        #include <algorithm>
+    $
+    decl $
+        Cache<>* instruction_cache = nullptr;
+        Cache<>* data_cache = nullptr;
+        // Repeated addresses exercise hits and evictions; 256 and 2 check invalid inputs.
+        const uint32_t addresses[20] = {0,4,0,0,64,0,256,2,128,192,0,64,128,192,0,64,128,192,0,4};
+        // A separate copy of expected memory lets us catch wrong or lost data.
+        uint32_t expected[64];
+        bool done = false;
+        int index = 0;
+        uint64_t issue_time;
+
+        // Send only when both request slots are free, and update the expected answer.
+        void submit(Cache<>* cache, bool store) {
+            assert(cache->request_id == cache->response_id);
+            assert(cache->read_request == cache->read_response);
+            cache->address = addresses[index];
+            cache->write = store;
+            cache->write_data = 777 + index + 1000 * cache->core_id;
+            if (store && cache->address <= 252 && cache->address % 4 == 0)
+                expected[cache->address/4] = cache->write_data;
+            cache->request_id++;
+        }
+
+        // Check the returned data, errors, request counts, and timing.
+        void check(Cache<>* cache, bool data_path) {
+            uint8_t expected_error = index == 6 ? 1 : index == 7 ? 2 : 0;
+            uint32_t expected_data = expected_error ? 0 :
+                data_path ? expected[addresses[index]/4] : addresses[index]/4;
+            assert(cache->response_id == uint64_t(index+1));
+            assert(cache->hits + cache->misses == uint64_t(index+1 - (index >= 6) - (index >= 7)));
+            assert(cache->start_time == issue_time);
+            assert(cache->error == expected_error && cache->read_data == expected_data);
+            if (!expected_error && cache->hit)
+                assert(cache->finish_time-issue_time == uint64_t(2*cache->CACHE_DELAY));
+        }
+    $
+    behavior
+        $for (int i = 0; i < 64; i++) expected[i]=i;$;
+        do
+            $
+            issue_time = current_time.toUint64();
+            // Read instructions every time; alternate data writes and reads.
+            submit(instruction_cache, false);
+            submit(data_cache, index % 2 == 0);
+            $;
+            [
+                wait until ($instruction_cache->response_id == instruction_cache->request_id$);
+                $check(instruction_cache, false);$;
+            ||
+                wait until ($data_cache->response_id == data_cache->request_id$);
+                $check(data_cache, true);$;
+            ];
+            $
+            assert(current_time.toUint64() == std::max(instruction_cache->finish_time, data_cache->finish_time));
+            log << endl << "PAIR index=" << index << " start=" << time(issue_time)
+                << " finish=" << current_time;
+            index++;
+            $;
+        while (index < 20) end do;
+        $log << endl << "PASS requests_per_cache=" << index
+            << " hits=" << instruction_cache->hits << " misses=" << instruction_cache->misses
+            << " data_hits=" << data_cache->hits << " data_misses=" << data_cache->misses
+            << " writebacks=" << data_cache->writebacks
+            << " core=" << int(data_cache->core_id)
+            << " instruction_writebacks=" << instruction_cache->writebacks
+            << " finish=" << current_time;$;
+        $done = true;$;
+    end behavior
+end procedure
