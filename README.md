@@ -1,10 +1,12 @@
-# Blocking write-back caches
+# Two-core write-back caches
 
 Build with `sitar translate main.sitar`, then `sitar compile`.
-Run `./sitar_sim 1000`; require `PASS requests_per_cache=20`.
+Run `./sitar_sim 1000`; require two `PASS requests_per_cache=20` lines
+(one each for `core=0` and `core=1`) followed by `PASS two_cores=2`.
 Run `python3 check.py` for the configuration and workload checks.
 
-Core runs the processor and two Cache procedures concurrently. Each cache has
+Top instantiates Core 0 (`core`) and Core 1 (`core1`). Each runs its own
+processor and private instruction/data Cache procedures concurrently. Each cache has
 its own external memory. Shared request/response sequence numbers allow one
 outstanding request per cache and same-phase completion for zero-delay hits.
 External memory reads occur in phase 0 and writes in phase 1.
@@ -90,3 +92,26 @@ and 32 cycles with no write-backs for one set/four ways. For the default
 layout, delay pairs (2,0), (0,3), and (2,3) finish at cycles 176, 340, and
 380, all with six write-backs. Instruction-cache write-backs are zero in
 every run because instruction requests are reads only.
+
+## Two-core test
+
+```sh
+sitar translate main.sitar
+sitar compile
+./sitar_sim 1000
+python3 check.py
+```
+
+Both processors independently run the checked 20-request trace. Core 1 uses
+store values offset by 1000 and nonzero delays, checking private state and
+allowing Core 0 to finish earlier. Top waits for both processors before stopping.
+Each private cache interface carries its fixed `core_id`; all downstream fill
+and write-back requests serialize this ID as the first byte (10 bytes total).
+Memory validates the originating ID. Responses keep the existing 5-byte format
+because each cache has a dedicated response connection.
+
+Configure Core 1 through `core1.data_cache`, `core1.instruction_cache`,
+`data_memory1`, and `instruction_memory1` in Top, just like Core 0.
+The existing write-back/write-allocate and LRU/FIFO/RANDOM policies are unchanged.
+Backing memories remain separate per cache, as in the original model; this is
+not a shared-memory multicore model. No MESI or coherence messages are modeled.

@@ -3,6 +3,7 @@
 procedure Processor
     include $#include "Cache.h"$
     decl $
+        bool done = false;
         Cache<>* instruction_cache = nullptr;
         Cache<>* data_cache = nullptr;
         int index = 0;
@@ -38,6 +39,6 @@ procedure Processor
         assert(data_cache->writebacks == 2);
         log << endl << "PASS FIFO";
         $;
-        stop simulation;
+        $done = true;$;
     end behavior
 end procedure

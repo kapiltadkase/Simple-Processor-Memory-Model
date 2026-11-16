@@ -30,7 +30,9 @@ for sets, ways, block, cache_delay, memory_delay, mode in [
         for command in [['sitar', 'translate', 'main.sitar'], ['sitar', 'compile'], ['./sitar_sim', '10000']]:
             result = subprocess.run(command, cwd=directory, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
             assert result.returncode == 0 and 'FAILURE' not in result.stdout, result.stdout
-        assert 'PASS requests_per_cache=20' in result.stdout, result.stdout
+        assert 'PASS two_cores=2' in result.stdout, result.stdout
+        assert result.stdout.count('PASS requests_per_cache=20') == 2, result.stdout
+        assert ' core=0 ' in result.stdout and ' core=1 ' in result.stdout, result.stdout
         summary = next(line.split('PASS ')[1] for line in result.stdout.splitlines() if 'PASS ' in line)
         count = int(re.search(r' writebacks=(\d+)', summary)[1])
         assert 'instruction_writebacks=0' in summary

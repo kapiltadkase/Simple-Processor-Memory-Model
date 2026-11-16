@@ -1,4 +1,4 @@
-// This file describes a simulated processor, two caches, and their memories.
+// Two independent cores, each with private instruction/data caches and memories.
 // Sitar controls timing and parallel work; code between $ markers is C++.
 // "wait" pauses a worker, and || separates workers that run alongside each other.
 
@@ -7,10 +7,10 @@ module Top
     submodule core : Core
     submodule instruction_memory : Memory
     submodule data_memory : Memory
-    // Each connection holds one message: a 9-byte request or a 5-byte reply.
-    net instruction_request : capacity 1 width 9
+    // Each connection holds one message: a 10-byte request or a 5-byte reply.
+    net instruction_request : capacity 1 width 10
     net instruction_response : capacity 1 width 5
-    net data_request : capacity 1 width 9
+    net data_request : capacity 1 width 10
     net data_response : capacity 1 width 5
 
     // Give the instruction cache and data cache their own memory connections.
@@ -22,7 +22,35 @@ module Top
     data_memory.request <= data_request
     data_memory.response => data_response
     core.data_response <= data_response
+    submodule core1 : Core
+    submodule instruction_memory1 : Memory
+    submodule data_memory1 : Memory
+    // Each connection holds one message: a 10-byte request or a 5-byte reply.
+    net instruction_request1 : capacity 1 width 10
+    net instruction_response1 : capacity 1 width 5
+    net data_request1 : capacity 1 width 10
+    net data_response1 : capacity 1 width 5
+
+    // Give the instruction cache and data cache their own memory connections.
+    core1.instruction_request => instruction_request1
+    instruction_memory1.request <= instruction_request1
+    instruction_memory1.response => instruction_response1
+    core1.instruction_response <= instruction_response1
+    core1.data_request => data_request1
+    data_memory1.request <= data_request1
+    data_memory1.response => data_response1
+    core1.data_response <= data_response1
     init $
+        core.instruction_cache.core_id = 0;
+        core.data_cache.core_id = 0;
+        core1.instruction_cache.core_id = 1;
+        core1.data_cache.core_id = 1;
+        instruction_memory1.core_id = 1;
+        data_memory1.core_id = 1;
+        core1.instruction_cache.CACHE_DELAY = 1;
+        core1.data_cache.CACHE_DELAY = 1;
+        instruction_memory1.MEM_DELAY = 1;
+        data_memory1.MEM_DELAY = 1;
         // Delays control how long cache lookups and memory operations take.
         // To choose a policy here, use (then rebuild):
         // core.data_cache.replacement_policy = Cache<>::LRU;
@@ -33,13 +61,18 @@ module Top
         instruction_memory.MEM_DELAY = 0;
         data_memory.MEM_DELAY = 0;
     $
+    behavior
+        wait until ($core.processor.done && core1.processor.done$);
+        $log << endl << "PASS two_cores=2";$;
+        stop simulation;
+    end behavior
 end module
 
 // Core contains the processor and its two caches.
 module Core
-    outport instruction_request : width 9
+    outport instruction_request : width 10
     inport instruction_response : width 5
-    outport data_request : width 9
+    outport data_request : width 10
     inport data_response : width 5
     procedure processor : Processor
     procedure instruction_cache : Cache<>
@@ -82,6 +115,7 @@ procedure Cache
         // RANDOM picks a slot at random instead. Empty slots are always used first.
         enum ReplacementPolicy { LRU, RANDOM, FIFO };
         ReplacementPolicy replacement_policy = LRU;
+        uint8_t core_id = 0; // Identifies all requests on this private cache interface.
         int CACHE_DELAY = 0;
 
         // Set this to true to make extra reads wait while the cache is busy.
@@ -116,7 +150,7 @@ procedure Cache
         }
 
         // Connections to memory, followed by the ordinary request and its result.
-        outport<9>* memory_request = nullptr;
+        outport<10>* memory_request = nullptr;
         inport<5>* memory_response = nullptr;
         // A larger request number means new work; matching numbers mean it is done.
         uint64_t request_id = 0, response_id = 0;
@@ -169,7 +203,7 @@ procedure Cache
             return value;
         }
         bool hit, sent;
-        token<9> request_token;
+        token<10> request_token;
         token<5> response_token;
     $
     behavior
@@ -239,7 +273,7 @@ procedure Cache
                         position = 0;
                         log << endl << "WRITEBACK_START base=" << victim_base;$;
                         do
-                            $sitar::pack(request_token, uint8_t(1), uint32_t(victim_base+position), load_word(position));
+                            $sitar::pack(request_token, core_id, uint8_t(1), uint32_t(victim_base+position), load_word(position));
                             sent = false;$;
                             do
                                 // Retry if the connection is full; send during phase 1.
@@ -267,7 +301,7 @@ procedure Cache
                         $valid[slot][way]=false;
                         position = 0;$;
                         do
-                            $sitar::pack(request_token, uint8_t(0), uint32_t(base+position), uint32_t(0));
+                            $sitar::pack(request_token, core_id, uint8_t(0), uint32_t(base+position), uint32_t(0));
                             sent = false;$;
                             do
                                 // Retry if the connection is full; send during phase 1.
@@ -308,7 +342,7 @@ procedure Cache
                 finish_time = current_time.toUint64();
                 busy = false;
                 response_id = active_id;
-                log << endl << "ACCESS id=" << response_id << " address=" << saved_address
+                log << endl << "ACCESS core=" << int(core_id) << " id=" << response_id << " address=" << saved_address
                     << " hit=" << hit << " write=" << int(saved_write)
                     << " error=" << int(error) << " ticks=" << finish_time-start_time;
                 $;
@@ -346,7 +380,7 @@ procedure Cache
                 end if;
                 $read_finish=current_time.toUint64();
                 read_response = read_request;
-                log << endl << "READ_COMPLETE address=" << read_address << " value=" << read_value
+                log << endl << "READ_COMPLETE core=" << int(core_id) << " address=" << read_address << " value=" << read_value
                     << " writing=" << writing << " finish=" << current_time;$;
             while (1) end do;
         ];
@@ -366,6 +400,7 @@ procedure Processor
         const uint32_t addresses[20] = {0,4,0,0,64,0,256,2,128,192,0,64,128,192,0,64,128,192,0,4};
         // A separate copy of expected memory lets us catch wrong or lost data.
         uint32_t expected[64];
+        bool done = false;
         int index = 0;
         uint64_t issue_time;
 
@@ -375,7 +410,7 @@ procedure Processor
             assert(cache->read_request == cache->read_response);
             cache->address = addresses[index];
             cache->write = store;
-            cache->write_data = 777 + index;
+            cache->write_data = 777 + index + 1000 * cache->core_id;
             if (store && cache->address <= 252 && cache->address % 4 == 0)
                 expected[cache->address/4] = cache->write_data;
             cache->request_id++;
@@ -421,24 +456,29 @@ procedure Processor
             << " hits=" << instruction_cache->hits << " misses=" << instruction_cache->misses
             << " data_hits=" << data_cache->hits << " data_misses=" << data_cache->misses
             << " writebacks=" << data_cache->writebacks
+            << " core=" << int(data_cache->core_id)
             << " instruction_writebacks=" << instruction_cache->writebacks
             << " finish=" << current_time;$;
-        stop simulation;
+        $done = true;$;
     end behavior
 end procedure
 
 // Memory holds 64 four-byte words (256 bytes total).
 // A store reply returns the value just written, so the cache can check completion.
 module Memory
-    inport request : width 9
+    inport request : width 10
     outport response : width 5
-    include $#include <stdexcept>$
+    include $
+        #include <stdexcept>
+        #include <cassert>
+    $
     decl $
+        uint8_t core_id = 0, request_core;
         int MEM_DELAY = 0;
         uint32_t words[64], address, value;
         uint8_t write, error;
         bool sent;
-        token<9> request_token;
+        token<10> request_token;
         token<5> response_token;
     $
     // Start with predictable data: word 0 contains 0, word 1 contains 1, and so on.
@@ -449,7 +489,8 @@ module Memory
             // Receive during phase 0, then wait out the configured memory delay.
             wait until (this_phase == 0 and $request.peek(request_token)$);
             $request.pull(request_token);
-            sitar::unpack(request_token, write, address, value);$;
+            sitar::unpack(request_token, request_core, write, address, value);
+            assert(request_core == core_id);$;
             wait(MEM_DELAY, 0);
             $
             // Validate before indexing memory; invalid requests return an error and zero.

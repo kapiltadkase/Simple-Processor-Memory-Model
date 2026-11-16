@@ -1,6 +1,7 @@
 procedure Processor
     include $#include "Cache.h"$
     decl $
+        bool done = false;
         Cache<>* instruction_cache = nullptr;
         Cache<>* data_cache = nullptr;
         int index=0, count=0;
@@ -58,6 +59,6 @@ procedure Processor
         wait until ($data_cache->read_request == data_cache->read_response$);
         $assert(data_cache->read_error == 2);
         log << endl << "PASS concurrent";$;
-        stop simulation;
+        $done = true;$;
     end behavior
 end procedure
