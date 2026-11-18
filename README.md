@@ -43,8 +43,22 @@ sets S (Shared), since the cache cannot establish exclusivity. A local store
 sets M (Modified), which also marks the line for write-back. E (Exclusive)
 is available for future use. Replacement ranks are tracked separately.
 
-The caches do not snoop or send invalidations. A store can remain
-in a dirty cache until eviction, and another cache can retain a stale copy.
+The explicit snooping bus connects the two private data caches. Issue
+`data_cache.request_bus(op, block_base)` with an aligned physical block address,
+then wait for `bus_pending` to clear. Each request carries the cache's core ID.
+Top grants at most one transaction per cycle when both data caches are idle.
+Simultaneous requests use round-robin priority, initially core 0.
+
+On success, `peer_state` reports the other cache's state before snooping.
+I means the peer had no copy. BusRd leaves a present peer in S. BusRdX and
+BusUpgr invalidate a present peer. BusUpgr requires a local S copy. If a queued
+upgrade loses its copy before the grant, `bus_retry` is true and the caller must
+request ownership again with BusRdX. A snoop of M writes the whole block
+directly to shared memory in the grant, without per-word transfer latency.
+
+Processor loads and stores still use the existing cache path. The caller drives
+bus requests explicitly and handles requester-side fills or ownership changes.
+Ordinary two-core workloads can therefore still observe stale copies.
 Dirty lines are not automatically flushed at termination.
 
 ## Tests

@@ -1,0 +1,62 @@
+            // Core 1 writes address 44 (word 11). Only its cache has the new value.
+            $
+                core1.data_cache.address = 44;
+                core1.data_cache.write = 1;
+                core1.data_cache.write_data = 12345;
+                core1.data_cache.request_id++;
+            $;
+            wait until ($core1.data_cache.response_id == 1$);
+
+            // Ask to read the same block in the same cycle. Core 0 gets the first turn.
+            wait until (this_phase == 1);
+            $
+                assert(data_memory.words[11] == 11);
+                core.data_cache.request_bus(Cache<>::BusRd, 32);
+                core1.data_cache.request_bus(Cache<>::BusRd, 32);
+            $;
+            wait until ($!core.data_cache.bus_pending$);
+            $
+                assert(core1.data_cache.bus_pending);
+                assert(core.data_cache.peer_state == Cache<>::MesiState::M);
+                assert(core1.data_cache.is_shared(32));
+                for (int i = 8; i < 12; ++i)
+                    assert(data_memory.words[i] == (i == 11 ? 12345u : uint32_t(i)));
+            $;
+
+            // Core 0 has asked about the block. It still needs to load its own copy.
+            wait until ($!core1.data_cache.bus_pending$);
+            $
+                assert(core1.data_cache.peer_state == Cache<>::MesiState::I);
+                core.data_cache.address = 44;
+                core.data_cache.request_id++;
+            $;
+            wait until ($core.data_cache.response_id == 1$);
+            $
+                assert(core.data_cache.read_data == 12345 && core.data_cache.is_shared(32));
+
+                // Both copies are shared. Core 0 wins the upgrade and core 1 must retry.
+                core.data_cache.request_bus(Cache<>::BusUpgr, 32);
+                core1.data_cache.request_bus(Cache<>::BusUpgr, 32);
+            $;
+            wait until ($!core1.data_cache.bus_pending$);
+            $
+                assert(!core.data_cache.bus_retry && core1.data_cache.bus_retry);
+                assert(core.data_cache.peer_state == Cache<>::MesiState::S);
+                assert(core1.data_cache.find_way(32) < 0 && core.data_cache.is_shared(32));
+
+                // Reverse direction. Core 1 asks to write after core 0 changes the value.
+                core.data_cache.write = 1;
+                core.data_cache.write_data = 54321;
+                core.data_cache.request_id++;
+            $;
+            wait until ($core.data_cache.response_id == 2$);
+            $
+                core1.data_cache.request_bus(Cache<>::BusRdX, 32);
+            $;
+            wait until ($!core1.data_cache.bus_pending$);
+            $
+                assert(!core1.data_cache.bus_retry && core1.data_cache.peer_state == Cache<>::MesiState::M);
+                assert(core.data_cache.find_way(32) < 0 && data_memory.words[11] == 54321);
+                assert(core.data_cache.writebacks == 1 && core1.data_cache.writebacks == 1);
+                log << endl << "PASS snoop";
+            $;

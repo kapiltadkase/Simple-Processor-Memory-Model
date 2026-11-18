@@ -8,6 +8,19 @@ shared_source = Path(__file__).with_name('main.sitar').read_text()
 source = re.sub(r'procedure Processor\n.*?end procedure', lambda _: Path(__file__).with_name('mixed.sitar').read_text(), shared_source, flags=re.S)
 source = re.sub(r'^.*peer_done.*\n', '', source, flags=re.M)
 source = source.replace('run processor;', 'if ($data_cache.core_id == 0$) then run processor; else $processor.done = true;$; end if;')
+
+# Pause the processors so the test controls exactly when each cache asks for the bus.
+snoop = Path(__file__).with_name('snoop.sitar').read_text()
+model = shared_source.replace('run processor;', 'wait until (0);')
+model = model.replace('wait until ($core.processor.done && core1.processor.done$);', snoop)
+with tempfile.TemporaryDirectory() as directory:
+    Path(directory, 'main.sitar').write_text(model)
+    for command in [['sitar', 'translate', 'main.sitar'], ['sitar', 'compile'], ['./sitar_sim', '10000']]:
+        result = subprocess.run(command, cwd=directory, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        assert result.returncode == 0 and 'FAILURE' not in result.stdout, result.stdout
+    assert 'PASS snoop' in result.stdout, result.stdout
+    print('PASS snoop: broadcast, arbitration and dirty intervention')
+
 for sets, ways, block, cache_delay, memory_delay, mode in [
     (4, 1, 16, 0, 0, "mixed"), (2, 2, 16, 0, 0, "mixed"), (1, 4, 16, 0, 0, "mixed"),
     (2, 2, 16, 2, 0, "mixed"), (2, 2, 16, 0, 3, "mixed"), (2, 2, 16, 2, 3, "mixed"),

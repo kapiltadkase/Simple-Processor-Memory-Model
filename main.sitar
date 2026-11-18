@@ -46,6 +46,10 @@ module Top
     arbiter.request1 <= data_request1
     arbiter.response1 => data_response1
     core1.data_response <= data_response1
+    decl $
+        // When both cores ask together, this core goes first.
+        int next_snoop = 0;
+    $
     init $
         core.instruction_cache.core_id = 0;
         core.data_cache.core_id = 0;
@@ -69,9 +73,36 @@ module Top
         data_memory.MEM_DELAY = 0;
     $
     behavior
-        wait until ($core.processor.done && core1.processor.done$);
-        $log << endl << "PASS two_cores=2";$;
-        stop simulation;
+        [
+            wait until ($core.processor.done && core1.processor.done$);
+            $log << endl << "PASS two_cores=2";$;
+            stop simulation;
+        ||
+            do
+                // Finish any cache fill or eviction before examining the block.
+                wait until (this_phase == 0 and
+                    $!core.data_cache.busy && !core1.data_cache.busy &&
+                     (core.data_cache.bus_pending || core1.data_cache.bus_pending)$);
+                $
+                    Cache<>* caches[] = {&core.data_cache, &core1.data_cache};
+                    int owner = caches[next_snoop]->bus_pending ? next_snoop : 1 - next_snoop;
+                    auto& requester = *caches[owner];
+                    auto& peer = *caches[1 - owner];
+
+                    // While this upgrade waited, the other core may have invalidated its copy.
+                    requester.bus_retry = requester.bus_request.op == Cache<>::BusUpgr &&
+                                          !requester.is_shared(requester.bus_request.block);
+                    if (!requester.bus_retry) {
+                        requester.peer_state = peer.snoop(requester.bus_request, data_memory.words);
+                    }
+
+                    // The requester can now read its result. The peer gets priority next time.
+                    requester.bus_pending = false;
+                    next_snoop = 1 - owner;
+                $;
+                wait until (this_phase == 1);
+            while (1) end do;
+        ];
     end behavior
 end module
 
@@ -140,9 +171,13 @@ procedure Cache
         // Find the extra read in the cache. -1 means it is missing or its address is invalid.
         int find_read() {
             if (read_address > 252 || read_address % 4) return -1;
-            int set = (read_address / BLOCK_SIZE) % NUM_SETS;
+            return find_way(read_address);
+        }
+
+        int find_way(uint32_t addr) const {
+            int set = (addr / BLOCK_SIZE) % NUM_SETS;
             for (int i = 0; i < NUM_WAYS; i++)
-                if (mesi[set][i] != MesiState::I && tags[set][i] == read_address / BLOCK_SIZE / NUM_SETS)
+                if (mesi[set][i] != MesiState::I && tags[set][i] == addr / BLOCK_SIZE / NUM_SETS)
                     return i;
             return -1;
         }
@@ -170,12 +205,68 @@ procedure Cache
         static_assert(NUM_WAYS > 0 && !(NUM_WAYS & (NUM_WAYS - 1)), "Invalid way count");
         static_assert(BLOCK_SIZE >= 4 && BLOCK_SIZE <= 256 && !(BLOCK_SIZE & (BLOCK_SIZE - 1)), "Invalid block size");
 
-        enum class MesiState : uint8_t { I = 0, M, E, S };
+        enum class MesiState : uint8_t {
+            I = 0,  // Invalid: this slot has no usable copy. All slots start here.
+            M,      // Modified: this cache has a newer value than memory.
+            E,      // Exclusive: only this cache holds a clean copy.
+            S       // Shared: another cache may also hold a copy.
+        };
         MesiState mesi[NUM_SETS][NUM_WAYS] = {};
 
         MesiState mesi_state(int set, int way_index) const {
             assert(set >= 0 && set < NUM_SETS && way_index >= 0 && way_index < NUM_WAYS);
             return mesi[set][way_index];
+        }
+
+        enum BusOp {
+            BusRd,   // Ask for a copy to read.
+            BusRdX,  // Ask for a copy to write. The peer must give up its copy.
+            BusUpgr  // We already have a shared copy. Ask the peer to give up its copy.
+        };
+
+        struct BusRequest {
+            uint8_t requester;
+            BusOp op;
+            uint32_t block;  // Byte address of the first byte in the block.
+        };
+
+        BusRequest bus_request{};
+        bool bus_pending = false;
+        bool bus_retry = false;  // A queued upgrade lost its shared copy.
+        MesiState peer_state = MesiState::I;  // Peer state before the last successful snoop.
+
+        bool is_shared(uint32_t block) const {
+            int found = find_way(block);
+            return found >= 0 && mesi[block / BLOCK_SIZE % NUM_SETS][found] == MesiState::S;
+        }
+
+        void request_bus(BusOp op, uint32_t block) {
+            if (bus_pending || block >= 256 || block % BLOCK_SIZE)
+                throw std::logic_error("Pending bus request or invalid block address");
+            if (op == BusUpgr && !is_shared(block))
+                throw std::logic_error("BusUpgr requires a shared line");
+            bus_request = {core_id, op, block};
+            bus_pending = true;
+        }
+
+        MesiState snoop(const BusRequest& req, uint32_t* memory_words) {
+            assert(req.requester != core_id);
+            int found = find_way(req.block);
+            if (found < 0) return MesiState::I;
+
+            int set = req.block / BLOCK_SIZE % NUM_SETS;
+            MesiState prior = mesi[set][found];
+
+            // Save every word before giving up the only up-to-date copy.
+            if (prior == MesiState::M) {
+                for (int pos = 0; pos < BLOCK_SIZE; pos += 4)
+                    memory_words[(req.block + pos) / 4] = line_word(set, found, pos);
+                writebacks++;
+            }
+
+            // Two readers can share a block. A writer needs the peer to drop it.
+            mesi[set][found] = req.op == BusRd ? MesiState::S : MesiState::I;
+            return prior;
         }
 
         uint32_t tags[NUM_SETS][NUM_WAYS] = {};
@@ -208,9 +299,9 @@ procedure Cache
         }
 
         // Join those four bytes back into a word.
-        uint32_t load_word(int pos) {
+        uint32_t line_word(int set, int line, int pos) const {
             uint32_t value = 0;
-            for (int i = 0; i < 4; i++) value = (value << 8) | values[slot][way][pos+i];
+            for (int i = 0; i < 4; i++) value = (value << 8) | values[set][line][pos+i];
             return value;
         }
         bool hit, sent;
@@ -243,9 +334,7 @@ procedure Cache
                 tag = saved_address / BLOCK_SIZE / NUM_SETS;
 
                 // A hit means the requested block is already in this set.
-                way = -1;
-                for (int i = 0; i < NUM_WAYS; i++)
-                    if (mesi[slot][i] != MesiState::I && tags[slot][i] == tag) way = i;
+                way = find_way(saved_address);
                 hit = !error && way >= 0;
 
                 // 3. On a miss, use an empty slot or choose a block to replace.
@@ -284,7 +373,7 @@ procedure Cache
                         position = 0;
                         log << endl << "WRITEBACK_START base=" << victim_base;$;
                         do
-                            $sitar::pack(request_token, core_id, uint8_t(1), uint32_t(victim_base+position), load_word(position));
+                            $sitar::pack(request_token, core_id, uint8_t(1), uint32_t(victim_base+position), line_word(slot, way, position));
                             sent = false;$;
                             do
                                 // Retry if the connection is full; send during phase 1.
@@ -344,7 +433,7 @@ procedure Cache
                         if (!hit) recency[slot][way] = NUM_WAYS;
                         touch(slot, way);
                     }
-                    read_data = error ? 0 : load_word(offset);$;
+                    read_data = error ? 0 : line_word(slot, way, offset);$;
                 end if;
                 $
                 // 7. Publish the result so the processor knows this request is finished.
