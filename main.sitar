@@ -51,6 +51,19 @@ module Top
         int next_snoop = 0;
     $
     init $
+        // Sitar's driver owns Top for the lifetime of the process. It can end
+        // the run at the cycle limit before either processor reaches done.
+        static Top* model = this;
+        std::atexit([] {
+            uint64_t total_hits = 0, total_misses = 0;
+            for (auto* cache : {&model->core.data_cache, &model->core1.data_cache}) {
+                std::cout << "DATA CACHE core=" << int(cache->core_id)
+                          << " hits=" << cache->hits << " misses=" << cache->misses << '\n';
+                total_hits += cache->hits;
+                total_misses += cache->misses;
+            }
+            std::cout << "DATA CACHE total hits=" << total_hits << " misses=" << total_misses << '\n';
+        });
         core.instruction_cache.core_id = 0;
         core.data_cache.core_id = 0;
         core1.instruction_cache.core_id = 1;
@@ -75,17 +88,7 @@ module Top
     behavior
         [
             wait until ($core.processor.done && core1.processor.done$);
-            $
-                uint64_t total_hits = 0, total_misses = 0;
-                for (auto* cache : {&core.data_cache, &core1.data_cache}) {
-                    log << endl << "DATA CACHE core=" << int(cache->core_id)
-                        << " hits=" << cache->hits << " misses=" << cache->misses;
-                    total_hits += cache->hits;
-                    total_misses += cache->misses;
-                }
-                log << endl << "DATA CACHE total hits=" << total_hits << " misses=" << total_misses;
-                log << endl << "PASS two_cores=2";
-            $;
+            $log << endl << "PASS two_cores=2";$;
             stop simulation;
         ||
             do
@@ -388,10 +391,6 @@ procedure Cache
                     victim_base = (tags[slot][way] * NUM_SETS + slot) * BLOCK_SIZE;
                 }
                 read_data = 0;
-                if (!error) {
-                    if (hit) hits++;
-                    else misses++;
-                }
                 $;
                 wait(CACHE_DELAY, 0);
                 if (not error) then
@@ -466,6 +465,10 @@ procedure Cache
                 end if;
                 $
                 // 7. Publish the result so the processor knows this request is finished.
+                if (!error) {
+                    if (hit) hits++;
+                    else misses++;
+                }
                 finish_time = current_time.toUint64();
                 busy = false;
                 response_id = active_id;
@@ -488,7 +491,6 @@ procedure Cache
                 read_value = 0;
                 if (!read_error && read_way >= 0) {
                     for (int i = 0; i < 4; i++) read_value=(read_value<<8)|values[read_slot][read_way][read_offset+i];
-                    hits++;
                     // LRU policy for extra read hits: refresh recency; FIFO keeps insertion order.
                     if (replacement_policy == LRU) touch(read_slot, read_way);
                     if (writing) overlap_hits++;
@@ -505,7 +507,8 @@ procedure Cache
                 else
                     wait(CACHE_DELAY, 0);
                 end if;
-                $read_finish=current_time.toUint64();
+                $if (!read_error && read_way >= 0) hits++;
+                read_finish=current_time.toUint64();
                 read_response = read_request;
                 log << endl << "READ_COMPLETE core=" << int(core_id) << " address=" << read_address << " value=" << read_value
                     << " writing=" << writing << " finish=" << current_time;$;
