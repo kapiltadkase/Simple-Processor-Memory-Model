@@ -4,6 +4,19 @@ Build with `sitar translate main.sitar`, then `sitar compile`; run
 `./sitar_sim 1000`. Expect `PASS shared core=0`, `PASS shared core=1`,
 and `PASS two_cores=2`. Run `python3 check.py` for regressions.
 
+To compare address patterns, run the same binary twice:
+
+```sh
+SITAR_WORKLOAD=uniform SITAR_SEED=42 ./sitar_sim 100000
+SITAR_WORKLOAD=locality SITAR_SEED=42 ./sitar_sim 100000
+```
+
+Each core issues 256 aligned data accesses, with a one-in-four chance of a store.
+Uniform samples all 64 words. Locality samples the first eight words three
+quarters of the time and all 64 otherwise. Both cores share that hot region.
+The seed defaults to 42. Each core has its own repeatable stream. Divide total
+hits by 512 to get the combined hit rate. The default workload is fixed.
+
 Each core has private instruction and data caches. Both data caches use exactly
 one `data_memory : Memory`, containing 64 four-byte words. Instruction memories
 remain private and separate from the shared data address space.
@@ -55,6 +68,9 @@ evictions still use the ordinary word-by-word write-back path.
 Dirty lines are not automatically flushed at termination.
 
 ## Tests
+
+Each core finishes with two reads of address 0. The first brings the block into
+its cache and the second hits, giving one hit and seven misses per core.
 
 The default two-core driver first reads address 0 from both caches, then evicts
 that clean line using addresses 32 and 64. Core 0 stores 12345 at address 0 and

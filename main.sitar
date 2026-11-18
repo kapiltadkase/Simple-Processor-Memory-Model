@@ -75,7 +75,17 @@ module Top
     behavior
         [
             wait until ($core.processor.done && core1.processor.done$);
-            $log << endl << "PASS two_cores=2";$;
+            $
+                uint64_t total_hits = 0, total_misses = 0;
+                for (auto* cache : {&core.data_cache, &core1.data_cache}) {
+                    log << endl << "DATA CACHE core=" << int(cache->core_id)
+                        << " hits=" << cache->hits << " misses=" << cache->misses;
+                    total_hits += cache->hits;
+                    total_misses += cache->misses;
+                }
+                log << endl << "DATA CACHE total hits=" << total_hits << " misses=" << total_misses;
+                log << endl << "PASS two_cores=2";
+            $;
             stop simulation;
         ||
             do
@@ -506,32 +516,70 @@ end procedure
 
 // Shared-memory test: evict cached copies before checking another core's store.
 procedure Processor
-    include $#include "Cache.h"$
+    include $
+        #include "Cache.h"
+        #include <cstdlib>
+        #include <string>
+    $
     decl $
         Cache<>* instruction_cache = nullptr;
         Cache<>* data_cache = nullptr;
         bool done = false;
         bool* peer_done = nullptr;
         int index = 0;
-        uint32_t addresses[7] = {0,32,64,0,32,64,0};
+        std::mt19937 rng;
+        std::string workload = "fixed";
+        uint32_t seed = 42;
+        uint32_t addresses[8] = {0, 32, 64, 0, 32, 64, 0, 0};
     $
     behavior
-        do
-            if (index == 3 and $data_cache->core_id == 1$) then
-                wait until ($*peer_done$);
-            end if;
-            $data_cache->address = addresses[index];
-            data_cache->write = index == 3 && data_cache->core_id == 0;
-            data_cache->write_data = 12345;
-            data_cache->request_id++;$;
-            wait until ($data_cache->request_id == data_cache->response_id$);
-            $assert(data_cache->error == 0);
-            assert(data_cache->read_data == (addresses[index] == 0 && index >= 3 ? 12345 : addresses[index]/4));
-            index++;$;
-        while (index < 7) end do;
-        $assert(data_cache->core_id == 1 || data_cache->writebacks == 1);
-        log << endl << "PASS shared core=" << int(data_cache->core_id);
-        done = true;$;
+        $if (const char* mode = std::getenv("SITAR_WORKLOAD")) workload = mode;
+        if (workload != "fixed" && workload != "uniform" && workload != "locality")
+            throw std::runtime_error("Choose fixed, uniform or locality for SITAR_WORKLOAD");$;
+        if ($workload == "fixed"$) then
+            do
+                if (index == 3 and $data_cache->core_id == 1$) then
+                    wait until ($*peer_done$);
+                end if;
+                $data_cache->address = addresses[index];
+                data_cache->write = index == 3 && data_cache->core_id == 0;
+                data_cache->write_data = 12345;
+                data_cache->request_id++;$;
+                wait until ($data_cache->request_id == data_cache->response_id$);
+                $assert(data_cache->error == 0);
+                assert(data_cache->read_data == (addresses[index] == 0 && index >= 3 ? 12345 : addresses[index]/4));
+                if (index == 7) assert(data_cache->hit);
+                index++;$;
+            while (index < 8) end do;
+            $assert(data_cache->core_id == 1 || data_cache->writebacks == 1);
+            log << endl << "PASS shared core=" << int(data_cache->core_id);$;
+        else
+            $if (const char* value = std::getenv("SITAR_SEED")) {
+                std::string digits(value);
+                if (digits.empty() || digits.find_first_not_of("0123456789") != std::string::npos ||
+                    std::stoull(digits) > UINT32_MAX)
+                    throw std::runtime_error("SITAR_SEED must be an unsigned 32-bit integer");
+                seed = std::stoul(digits);
+            }
+            rng.seed(seed + data_cache->core_id);
+            log << endl << "WORKLOAD " << workload << " core=" << int(data_cache->core_id)
+                << " seed=" << seed << " requests=256";$;
+            do
+                // Both modes use the same random draws. Only the address range changes.
+                $uint32_t word = rng() % 64;
+                bool hot = rng() % 4 != 0;
+                if (workload == "locality" && hot) word %= 8;
+                data_cache->address = 4 * word;
+                data_cache->write = rng() % 4 == 0;
+                data_cache->write_data = rng();
+                data_cache->request_id++;$;
+                wait until ($data_cache->request_id == data_cache->response_id$);
+                $assert(data_cache->error == 0);
+                index++;$;
+            while (index < 256) end do;
+            $assert(data_cache->hits + data_cache->misses == 256);$;
+        end if;
+        $done = true;$;
     end behavior
 end procedure
 
