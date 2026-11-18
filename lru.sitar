@@ -25,7 +25,7 @@ procedure Processor
             $assert(data_cache->error == 0);
             assert(data_cache->hit == expected_hits[index]);
             assert(data_cache->mesi_state(data_cache->slot, data_cache->way) ==
-                   (index <= 2 || index == 5 ? Cache<>::MesiState::M : Cache<>::MesiState::S));
+                   (index <= 2 || index == 5 ? Cache<>::MesiState::M : Cache<>::MesiState::E));
             if (index == 6) assert(data_cache->read_data == 101);$;
             if (index == 3) then
                 $data_cache->read_address=0; data_cache->read_request++;$;
@@ -35,8 +35,6 @@ procedure Processor
             $index++;$;
         while (index < 7) end do;
         $assert(data_cache->writebacks == 1);
-        // Seed E on the last clean fill, then invalidate it while retaining its tag.
-        data_cache->mesi[data_cache->slot][data_cache->way] = Cache<>::MesiState::E;
         data_cache->read_address = data_cache->address;
         assert(data_cache->find_read() == data_cache->way);
         data_cache->request_id++;$;
@@ -47,7 +45,7 @@ procedure Processor
         data_cache->request_id++;$;
         wait until ($data_cache->request_id == data_cache->response_id$);
         $assert(!data_cache->hit && data_cache->error == 0 && data_cache->read_data == 101);
-        assert(data_cache->mesi_state(data_cache->slot, data_cache->way) == Cache<>::MesiState::S);
+        assert(data_cache->mesi_state(data_cache->slot, data_cache->way) == Cache<>::MesiState::E);
         log << endl << "PASS LRU";$;
         $done = true;$;
     end behavior

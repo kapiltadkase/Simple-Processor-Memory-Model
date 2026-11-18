@@ -81,7 +81,8 @@ module Top
             do
                 // Finish any cache fill or eviction before examining the block.
                 wait until (this_phase == 0 and
-                    $!core.data_cache.busy && !core1.data_cache.busy &&
+                    $(!core.data_cache.busy || core.data_cache.bus_pending) &&
+                     (!core1.data_cache.busy || core1.data_cache.bus_pending) &&
                      (core.data_cache.bus_pending || core1.data_cache.bus_pending)$);
                 $
                     Cache<>* caches[] = {&core.data_cache, &core1.data_cache};
@@ -119,6 +120,7 @@ module Core
         // Tell each cache where to send requests and where to receive replies.
         instruction_cache.memory_request = &instruction_request;
         instruction_cache.memory_response = &instruction_response;
+        data_cache.coherent = true;
         data_cache.memory_request = &data_request;
         data_cache.memory_response = &data_response;
         processor.instruction_cache = &instruction_cache;
@@ -231,6 +233,8 @@ procedure Cache
         };
 
         BusRequest bus_request{};
+        uint64_t bus_requests = 0;
+        bool coherent = false;  // Only private data caches share this bus.
         bool bus_pending = false;
         bool bus_retry = false;  // A queued upgrade lost its shared copy.
         MesiState peer_state = MesiState::I;  // Peer state before the last successful snoop.
@@ -245,6 +249,7 @@ procedure Cache
                 throw std::logic_error("Pending bus request or invalid block address");
             if (op == BusUpgr && !is_shared(block))
                 throw std::logic_error("BusUpgr requires a shared line");
+            bus_requests++;
             bus_request = {core_id, op, block};
             bus_pending = true;
         }
@@ -333,6 +338,20 @@ procedure Cache
                 slot = (saved_address / BLOCK_SIZE) % NUM_SETS;
                 tag = saved_address / BLOCK_SIZE / NUM_SETS;
 
+                // While queued, either cache can be snooped. After grant, busy keeps
+                // later grants waiting until this access has installed its result.
+                way = find_way(saved_address);
+                $;
+                if ($coherent && !error && (way < 0 || (saved_write && is_shared(base)))$) then
+                    $request_bus(!saved_write ? BusRd : way < 0 ? BusRdX : BusUpgr, base);$;
+                    wait until (not bus_pending);
+                    if (bus_retry) then
+                        // The other writer invalidated our shared copy while we waited.
+                        $request_bus(BusRdX, base);$;
+                        wait until (not bus_pending);
+                    end if;
+                end if;
+                $
                 // A hit means the requested block is already in this set.
                 way = find_way(saved_address);
                 hit = !error && way >= 0;
@@ -417,7 +436,7 @@ procedure Cache
                             position+=4;$;
                         while (not error and position < BLOCK_SIZE) end do;
                         $if (!error) {
-                            mesi[slot][way] = MesiState::S;
+                            mesi[slot][way] = coherent && peer_state == MesiState::I ? MesiState::E : MesiState::S;
                             tags[slot][way] = tag;
                         }$;
                     end if;

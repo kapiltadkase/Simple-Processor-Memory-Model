@@ -38,27 +38,20 @@ and memory delays in Top. NUM_SETS, NUM_WAYS and BLOCK_SIZE are structural
 parameters; defaults are two sets, two ways and 16-byte blocks.
 
 Inspect a private cache line with `data_cache.mesi_state(set, way)`. The shared
-Cache implementation initializes every line to I (Invalid). A complete fill
-sets S (Shared), since the cache cannot establish exclusivity. A local store
-sets M (Modified), which also marks the line for write-back. E (Exclusive)
-is available for future use. Replacement ranks are tracked separately.
+Cache implementation initializes every line to I (Invalid). A data read miss issues BusRd. The new line
+is Exclusive when the peer has no copy and Shared otherwise. A read hit
+keeps its state. Stores to Exclusive or Modified lines complete locally in
+Modified. A store to a Shared line issues BusUpgr. A write miss issues BusRdX.
 
-The explicit snooping bus connects the two private data caches. Issue
-`data_cache.request_bus(op, block_base)` with an aligned physical block address,
-then wait for `bus_pending` to clear. Each request carries the cache's core ID.
-Top grants at most one transaction per cycle when both data caches are idle.
-Simultaneous requests use round-robin priority, initially core 0.
+The bus broadcasts the requester ID and aligned block address to the peer.
+BusRd downgrades a present peer to Shared. BusRdX and BusUpgr invalidate
+its copy. A Modified peer writes the entire block to shared memory before
+downgrading or invalidating it. This intervention is atomic in the simulator.
 
-On success, `peer_state` reports the other cache's state before snooping.
-I means the peer had no copy. BusRd leaves a present peer in S. BusRdX and
-BusUpgr invalidate a present peer. BusUpgr requires a local S copy. If a queued
-upgrade loses its copy before the grant, `bus_retry` is true and the caller must
-request ownership again with BusRdX. A snoop of M writes the whole block
-directly to shared memory in the grant, without per-word transfer latency.
-
-Processor loads and stores still use the existing cache path. The caller drives
-bus requests explicitly and handles requester-side fills or ownership changes.
-Ordinary two-core workloads can therefore still observe stale copies.
+Simultaneous requests use round-robin priority, initially core 0. The bus
+waits for each granted processor access to finish before the next grant.
+A competing upgrade that lost its shared copy retries with BusRdX. Dirty
+evictions still use the ordinary word-by-word write-back path.
 Dirty lines are not automatically flushed at termination.
 
 ## Tests

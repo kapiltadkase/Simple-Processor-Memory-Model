@@ -1,62 +1,82 @@
-            // Core 1 writes address 44 (word 11). Only its cache has the new value.
-            $
-                core1.data_cache.address = 44;
-                core1.data_cache.write = 1;
-                core1.data_cache.write_data = 12345;
-                core1.data_cache.request_id++;
-            $;
-            wait until ($core1.data_cache.response_id == 1$);
+decl $
+    struct Step {
+        int core, write, value, result;
+        Cache<>::MesiState state[2];
+        int requests[2];
+    };
+    using State = Cache<>::MesiState;
+    int step_index = 0;
+    const Step steps[10] = {
+        {0, 0, 0, 11, {State::E, State::I}, {1, 0}},
+        {0, 0, 0, 11, {State::E, State::I}, {1, 0}},
+        {0, 1, 101, 101, {State::M, State::I}, {1, 0}},
+        {0, 0, 0, 101, {State::M, State::I}, {1, 0}},
+        {0, 1, 102, 102, {State::M, State::I}, {1, 0}},
+        {1, 0, 0, 102, {State::S, State::S}, {1, 1}},
+        {0, 0, 0, 102, {State::S, State::S}, {1, 1}},
+        {1, 1, 201, 201, {State::I, State::M}, {1, 2}},
+        {0, 1, 301, 301, {State::M, State::I}, {2, 2}},
+        {1, 0, 0, 301, {State::S, State::S}, {2, 3}},
+    };
+$
+behavior
+// Each row drives an ordinary processor access to byte address 44.
+// Check both caches and their bus traffic after every response.
+do
+    $
+        const auto& step = steps[step_index];
+        auto& cache = step.core ? core1.data_cache : core.data_cache;
+        cache.address = 44;
+        cache.write = step.write;
+        cache.write_data = step.value;
+        cache.request_id++;
+    $;
+    wait until ($core.data_cache.request_id == core.data_cache.response_id &&
+                 core1.data_cache.request_id == core1.data_cache.response_id$);
+    $
+        const auto& step = steps[step_index++];
+        Cache<>* caches[] = {&core.data_cache, &core1.data_cache};
+        assert(caches[step.core]->read_data == uint32_t(step.result));
+        for (int i = 0; i < 2; ++i) {
+            int way = caches[i]->find_way(44);
+            auto state = way < 0 ? State::I : caches[i]->mesi_state(0, way);
+            assert(state == step.state[i]);
+            assert(caches[i]->bus_requests == uint64_t(step.requests[i]));
+        }
+    $;
+while ($step_index < 10$) end do;
 
-            // Ask to read the same block in the same cycle. Core 0 gets the first turn.
-            wait until (this_phase == 1);
-            $
-                assert(data_memory.words[11] == 11);
-                core.data_cache.request_bus(Cache<>::BusRd, 32);
-                core1.data_cache.request_bus(Cache<>::BusRd, 32);
-            $;
-            wait until ($!core.data_cache.bus_pending$);
-            $
-                assert(core1.data_cache.bus_pending);
-                assert(core.data_cache.peer_state == Cache<>::MesiState::M);
-                assert(core1.data_cache.is_shared(32));
-                for (int i = 8; i < 12; ++i)
-                    assert(data_memory.words[i] == (i == 11 ? 12345u : uint32_t(i)));
-            $;
+// Both writers have S. Core 0 wins this tie. Core 1 retries with BusRdX.
+$core.data_cache.write = core1.data_cache.write = 1;
+core.data_cache.write_data = 401;
+core1.data_cache.write_data = 402;
+core.data_cache.request_id++;
+core1.data_cache.request_id++;$;
+wait until ($core.data_cache.request_id == core.data_cache.response_id &&
+             core1.data_cache.request_id == core1.data_cache.response_id$);
+$assert(core.data_cache.find_way(44) < 0);
+assert(core1.data_cache.mesi_state(0, core1.data_cache.find_way(44)) == State::M);
+assert(core1.data_cache.read_data == 402 && data_memory.words[11] == 401);
+assert(core1.data_cache.bus_request.op == Cache<>::BusRdX);
+// Two simultaneous cold reads must finish with two shared copies.
+core.data_cache.address = core1.data_cache.address = 0;
+core.data_cache.write = core1.data_cache.write = 0;
+core.data_cache.request_id++;
+core1.data_cache.request_id++;$;
+wait until ($core.data_cache.request_id == core.data_cache.response_id &&
+             core1.data_cache.request_id == core1.data_cache.response_id$);
+$assert(core.data_cache.is_shared(0) && core1.data_cache.is_shared(0));
+assert(core.data_cache.peer_state == State::I && core1.data_cache.peer_state == State::E);
 
-            // Core 0 has asked about the block. It still needs to load its own copy.
-            wait until ($!core1.data_cache.bus_pending$);
-            $
-                assert(core1.data_cache.peer_state == Cache<>::MesiState::I);
-                core.data_cache.address = 44;
-                core.data_cache.request_id++;
-            $;
-            wait until ($core.data_cache.response_id == 1$);
-            $
-                assert(core.data_cache.read_data == 12345 && core.data_cache.is_shared(32));
-
-                // Both copies are shared. Core 0 wins the upgrade and core 1 must retry.
-                core.data_cache.request_bus(Cache<>::BusUpgr, 32);
-                core1.data_cache.request_bus(Cache<>::BusUpgr, 32);
-            $;
-            wait until ($!core1.data_cache.bus_pending$);
-            $
-                assert(!core.data_cache.bus_retry && core1.data_cache.bus_retry);
-                assert(core.data_cache.peer_state == Cache<>::MesiState::S);
-                assert(core1.data_cache.find_way(32) < 0 && core.data_cache.is_shared(32));
-
-                // Reverse direction. Core 1 asks to write after core 0 changes the value.
-                core.data_cache.write = 1;
-                core.data_cache.write_data = 54321;
-                core.data_cache.request_id++;
-            $;
-            wait until ($core.data_cache.response_id == 2$);
-            $
-                core1.data_cache.request_bus(Cache<>::BusRdX, 32);
-            $;
-            wait until ($!core1.data_cache.bus_pending$);
-            $
-                assert(!core1.data_cache.bus_retry && core1.data_cache.peer_state == Cache<>::MesiState::M);
-                assert(core.data_cache.find_way(32) < 0 && data_memory.words[11] == 54321);
-                assert(core.data_cache.writebacks == 1 && core1.data_cache.writebacks == 1);
-                log << endl << "PASS snoop";
-            $;
+// A write miss must also revoke a clean exclusive copy.
+core.data_cache.address = 16;
+core.data_cache.request_id++;$;
+wait until ($core.data_cache.request_id == core.data_cache.response_id$);
+$assert(core.data_cache.mesi_state(1, core.data_cache.find_way(16)) == State::E);
+core1.data_cache.address = 16;
+core1.data_cache.write = 1;
+core1.data_cache.request_id++;$;
+wait until ($core1.data_cache.request_id == core1.data_cache.response_id$);
+$assert(core.data_cache.find_way(16) < 0);
+assert(core1.data_cache.mesi_state(1, core1.data_cache.find_way(16)) == State::M);
+log << endl << "PASS snoop";$;

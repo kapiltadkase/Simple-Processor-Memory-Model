@@ -12,7 +12,9 @@ source = source.replace('run processor;', 'if ($data_cache.core_id == 0$) then r
 # Pause the processors so the test controls exactly when each cache asks for the bus.
 snoop = Path(__file__).with_name('snoop.sitar').read_text()
 model = shared_source.replace('run processor;', 'wait until (0);')
-model = model.replace('wait until ($core.processor.done && core1.processor.done$);', snoop)
+declarations, behavior = snoop.split('\nbehavior\n')
+model = model.replace('    init $', declarations + '\n    init $', 1)
+model = model.replace('wait until ($core.processor.done && core1.processor.done$);', behavior)
 with tempfile.TemporaryDirectory() as directory:
     Path(directory, 'main.sitar').write_text(model)
     for command in [['sitar', 'translate', 'main.sitar'], ['sitar', 'compile'], ['./sitar_sim', '10000']]:
