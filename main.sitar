@@ -142,7 +142,7 @@ procedure Cache
             if (read_address > 252 || read_address % 4) return -1;
             int set = (read_address / BLOCK_SIZE) % NUM_SETS;
             for (int i = 0; i < NUM_WAYS; i++)
-                if (valid[set][i] && tags[set][i] == read_address / BLOCK_SIZE / NUM_SETS)
+                if (mesi[set][i] != MesiState::I && tags[set][i] == read_address / BLOCK_SIZE / NUM_SETS)
                     return i;
             return -1;
         }
@@ -170,10 +170,14 @@ procedure Cache
         static_assert(NUM_WAYS > 0 && !(NUM_WAYS & (NUM_WAYS - 1)), "Invalid way count");
         static_assert(BLOCK_SIZE >= 4 && BLOCK_SIZE <= 256 && !(BLOCK_SIZE & (BLOCK_SIZE - 1)), "Invalid block size");
 
-        // valid: this slot contains usable data. dirty: its data has changed since loading.
-        // A tag identifies which memory block is stored here; values holds its bytes.
-        bool valid[NUM_SETS][NUM_WAYS] = {};
-        bool dirty[NUM_SETS][NUM_WAYS] = {};
+        enum class MesiState : uint8_t { I = 0, M, E, S };
+        MesiState mesi[NUM_SETS][NUM_WAYS] = {};
+
+        MesiState mesi_state(int set, int way_index) const {
+            assert(set >= 0 && set < NUM_SETS && way_index >= 0 && way_index < NUM_WAYS);
+            return mesi[set][way_index];
+        }
+
         uint32_t tags[NUM_SETS][NUM_WAYS] = {};
         uint8_t values[NUM_SETS][NUM_WAYS][BLOCK_SIZE] = {};
 
@@ -186,7 +190,7 @@ procedure Cache
         // LRU / FIFO shared helper: mark this block newest and age the blocks that were newer.
         void touch(int set, int accessed) {
             for (int i = 0; i < NUM_WAYS; i++)
-                if (valid[set][i] && i != accessed && recency[set][i] <= recency[set][accessed])
+                if (mesi[set][i] != MesiState::I && i != accessed && recency[set][i] <= recency[set][accessed])
                     recency[set][i]++;
             recency[set][accessed] = 0;
         }
@@ -241,13 +245,13 @@ procedure Cache
                 // A hit means the requested block is already in this set.
                 way = -1;
                 for (int i = 0; i < NUM_WAYS; i++)
-                    if (valid[slot][i] && tags[slot][i] == tag) way = i;
+                    if (mesi[slot][i] != MesiState::I && tags[slot][i] == tag) way = i;
                 hit = !error && way >= 0;
 
                 // 3. On a miss, use an empty slot or choose a block to replace.
                 if (!error && !hit) {
                     for (int i = 0; i < NUM_WAYS; i++)
-                        if (!valid[slot][i]) {
+                        if (mesi[slot][i] == MesiState::I) {
                             way = i;
                             break;
                         }
@@ -275,7 +279,7 @@ procedure Cache
                 if (not error) then
                     // 4. Save a changed old block before throwing it away.
                     // Transfer four bytes at a time and wait for each reply.
-                    if (not hit and $valid[slot][way] && dirty[slot][way]$) then
+                    if (not hit and $mesi[slot][way] == MesiState::M$) then
                         $writing=true;
                         position = 0;
                         log << endl << "WRITEBACK_START base=" << victim_base;$;
@@ -297,7 +301,6 @@ procedure Cache
                         while (not error and position < BLOCK_SIZE) end do;
                         $writing=false;
                         if (!error) {
-                            dirty[slot][way]=false;
                             writebacks++;
                             log << endl << "WRITEBACK base=" << victim_base << " bytes=" << BLOCK_SIZE;
                         }$;
@@ -305,7 +308,7 @@ procedure Cache
 
                     // 5. Fetch the missing block. It becomes usable only after every word arrives.
                     if (not error and not hit) then
-                        $valid[slot][way]=false;
+                        $mesi[slot][way] = MesiState::I;
                         position = 0;$;
                         do
                             $sitar::pack(request_token, core_id, uint8_t(0), uint32_t(base+position), uint32_t(0));
@@ -325,16 +328,15 @@ procedure Cache
                             position+=4;$;
                         while (not error and position < BLOCK_SIZE) end do;
                         $if (!error) {
-                            valid[slot][way] = true;
+                            mesi[slot][way] = MesiState::S;
                             tags[slot][way] = tag;
-                            dirty[slot][way] = false;
                         }$;
                     end if;
 
                     // 6. Apply a store to the cached copy and mark it for a later write-back.
                     $if (!error && saved_write) {
                         save_word(offset, saved_data);
-                        dirty[slot][way]=true;
+                        mesi[slot][way] = MesiState::M;
                     }
                     // LRU policy: update ranks on every successful access, including hits.
                     // FIFO policy: update ranks only on insertion (a miss); hits keep their place.

@@ -9,6 +9,13 @@ procedure Processor
         bool expected_hits[7] = {false, false, true, false, false, true, false};
     $
     behavior
+        $using State = Cache<>::MesiState;
+        for (int set = 0; set < 2; ++set)
+            for (int way = 0; way < 2; ++way)
+                assert(data_cache->mesi_state(set, way) == State::I);
+        // Address zero matches the cold tags in both invalid ways.
+        data_cache->read_address = 0;
+        assert(data_cache->find_read() == -1);$;
         do
             $data_cache->address=addresses[index];
             data_cache->write=index <= 2;
@@ -17,6 +24,8 @@ procedure Processor
             wait until ($data_cache->request_id == data_cache->response_id$);
             $assert(data_cache->error == 0);
             assert(data_cache->hit == expected_hits[index]);
+            assert(data_cache->mesi_state(data_cache->slot, data_cache->way) ==
+                   (index <= 2 || index == 5 ? Cache<>::MesiState::M : Cache<>::MesiState::S));
             if (index == 6) assert(data_cache->read_data == 101);$;
             if (index == 3) then
                 $data_cache->read_address=0; data_cache->read_request++;$;
@@ -26,6 +35,19 @@ procedure Processor
             $index++;$;
         while (index < 7) end do;
         $assert(data_cache->writebacks == 1);
+        // Seed E on the last clean fill, then invalidate it while retaining its tag.
+        data_cache->mesi[data_cache->slot][data_cache->way] = Cache<>::MesiState::E;
+        data_cache->read_address = data_cache->address;
+        assert(data_cache->find_read() == data_cache->way);
+        data_cache->request_id++;$;
+        wait until ($data_cache->request_id == data_cache->response_id$);
+        $assert(data_cache->hit && data_cache->read_data == 101);
+        data_cache->mesi[data_cache->slot][data_cache->way] = Cache<>::MesiState::I;
+        assert(data_cache->find_read() == -1);
+        data_cache->request_id++;$;
+        wait until ($data_cache->request_id == data_cache->response_id$);
+        $assert(!data_cache->hit && data_cache->error == 0 && data_cache->read_data == 101);
+        assert(data_cache->mesi_state(data_cache->slot, data_cache->way) == Cache<>::MesiState::S);
         log << endl << "PASS LRU";$;
         $done = true;$;
     end behavior

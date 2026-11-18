@@ -37,7 +37,13 @@ shared memory arbitration only applies to fills and write-backs. Configure cache
 and memory delays in Top. NUM_SETS, NUM_WAYS and BLOCK_SIZE are structural
 parameters; defaults are two sets, two ways and 16-byte blocks.
 
-No MESI transitions, snooping or invalidations are implemented. A store can remain
+Inspect a private cache line with `data_cache.mesi_state(set, way)`. The shared
+Cache implementation initializes every line to I (Invalid). A complete fill
+sets S (Shared), since the cache cannot establish exclusivity. A local store
+sets M (Modified), which also marks the line for write-back. E (Exclusive)
+is available for future use. Replacement ranks are tracked separately.
+
+The caches do not snoop or send invalidations. A store can remain
 in a dirty cache until eviction, and another cache can retain a stale copy.
 Dirty lines are not automatically flushed at termination.
 
