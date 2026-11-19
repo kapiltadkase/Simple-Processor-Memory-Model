@@ -1,119 +1,120 @@
-# Two-core shared data memory
+# Two-core MESI cache simulator in Sitar
 
-Build with `sitar translate main.sitar`, then `sitar compile`; run
-`./sitar_sim 1000`. Expect `PASS shared core=0`, `PASS shared core=1`,
-and `PASS two_cores=2`. Run `python3 check.py` for regressions.
+Two simulated processors read and write the same 256 bytes of data memory. Each has a private cache, so both can hold a copy of the same address. If core 0 changes its copy, how does core 1 get the new value? The model implements **MESI cache coherence** to keep those copies consistent. It also lets you measure how often each core hits in its cache, goes to memory, or asks the other core to give up a block.
 
-### Run with a replacement policy
+The original A1 assignment starts with one processor talking to memory. Its bonus questions introduce caches, concurrency, set associativity, and write-back. This project extends that work with a second core, shared data memory, multiple replacement policies, and MESI. The processors in this version generate memory requests from a workload. The simulator models exactly two cores.
 
-From the project directory, run the locality workload with FIFO:
+## Build and run
 
-```sh
-SITAR_POLICY=fifo SITAR_WORKLOAD=locality SITAR_SEED=42 ./sitar_sim 100000
-```
-
-Change `fifo` to `lru` or `random` to select that policy for both data caches.
-Omitting `SITAR_POLICY` selects LRU. You can switch policies without rebuilding.
-
-To compare address patterns, run the same binary twice:
+From this directory, with the Sitar toolchain on your PATH (including its SCons and C++ build dependencies), run:
 
 ```sh
-SITAR_WORKLOAD=uniform SITAR_SEED=42 ./sitar_sim 100000
-SITAR_WORKLOAD=locality SITAR_SEED=42 ./sitar_sim 100000
+sitar translate main.sitar
+sitar compile
+./sitar_sim 1000
 ```
 
-Each core issues 256 aligned data accesses, with a one-in-four chance of a store.
-Uniform samples all 64 words. Locality samples the first eight words three
-quarters of the time and all 64 otherwise. Both cores share that hot region.
-The seed defaults to 42. Each core has its own repeatable stream. Divide total
-hits by 512 to get the combined hit rate. The default workload is fixed.
+Translation generates C++ in `Output/`. Compilation builds `sitar_sim`. Rebuild after editing the model. The number after the executable is the **maximum simulated cycles**. The default fixed workload should finish with `PASS shared core=0`, `PASS shared core=1`, and `PASS two_cores=2`.
 
-Each core has private instruction and data caches. Both data caches use exactly
-one `data_memory : Memory`, containing 64 four-byte words. Instruction memories
-remain private and separate from the shared data address space.
+For a longer workload, choose the settings at launch. For example, run the same address stream with three replacement policies:
 
-Request flow:
-
-```text
-core.data_cache  -> data_request  -> arbiter.request0 ─┐
-                                                    ├-> shared_request -> data_memory
-core1.data_cache -> data_request1 -> arbiter.request1 ─┘
+```sh
+SITAR_WORKLOAD=locality SITAR_SEED=42 SITAR_POLICY=lru    ./sitar_sim 100000
+SITAR_WORKLOAD=locality SITAR_SEED=42 SITAR_POLICY=fifo   ./sitar_sim 100000
+SITAR_WORKLOAD=locality SITAR_SEED=42 SITAR_POLICY=random ./sitar_sim 100000
 ```
 
-Both cores use identical physical byte addresses (0 through 255), without any
-core-specific translation or offset. Aligned word addresses range from 0 to 252.
-Requests carry core ID, operation, address and value in 10 bytes. Memory validates
-operation, alignment and bounds and returns a 5-byte error/value response.
+To compare address patterns, keep the policy and seed fixed and change `SITAR_WORKLOAD=locality` to `SITAR_WORKLOAD=uniform`. These settings use the same binary.
 
-The arbiter samples available requests in phase 0. If both are ready, it grants
-round-robin priority, initially core 0; after each grant priority switches to the
-other core. It forwards the unchanged request in phase 1 and waits for memory's
-reply before accepting another request. It remembers the owner and routes the
-reply from `shared_response` to only `data_response` or `data_response1`.
-Full output nets are retried. This serializes individual word transactions,
-including write acknowledgments and errors, with deterministic arbitration.
-A whole block transfer is not atomic: words from different cores may interleave.
+| Setting | Choices and meaning |
+|---|---|
+| `SITAR_WORKLOAD` | `fixed` (default) runs eight predictable data accesses per core. `uniform` samples all 64 words. `locality` chooses from the first eight words with 75% probability and from all 64 otherwise. Both cores use the same hot region. |
+| `SITAR_POLICY` | `lru` (default), `fifo`, or `random`. Applies to both **data** caches. |
+| `SITAR_SEED` | Unsigned 32-bit workload seed, default 42. Each core gets its own repeatable stream. Random replacement uses a separate, fixed generator seed. |
 
-Caches retain write-back/write-allocate behavior and LRU, FIFO and RANDOM
-replacement. A dirty eviction writes all words of the victim block before filling
-the new block. Each word waits for its response. Cache hits remain private;
-shared memory arbitration only applies to fills and write-backs. Configure cache
-and memory delays in Top. NUM_SETS, NUM_WAYS and BLOCK_SIZE are structural
-parameters; defaults are two sets, two ways and 16-byte blocks.
+Uniform and locality each issue 256 accesses per core, with a 25% chance of a store per access. The current locality generator uses a fixed hot region; it has no separate spatial and temporal locality settings. At the cycle limit, the simulator prints statistics even if the workload is unfinished. For a complete generated workload look for `PASS two_cores=2` and 512 total hits plus misses.
 
-Inspect a private cache line with `data_cache.mesi_state(set, way)`. The shared
-Cache implementation initializes every line to I (Invalid). A data read miss issues BusRd. The new line
-is Exclusive when the peer has no copy and Shared otherwise. A read hit
-keeps its state. Stores to Exclusive or Modified lines complete locally in
-Modified. A store to a Shared line issues BusUpgr. A write miss issues BusRdX.
+## Follow one request
 
-The bus broadcasts the requester ID and aligned block address to the peer.
-BusRd downgrades a present peer to Shared. BusRdX and BusUpgr invalidate
-its copy. A Modified peer writes the entire block to shared memory before
-downgrading or invalidating it. This intervention is atomic in the simulator.
+Start with a cold cache and a read of byte address 44. Memory starts with word 0 equal to 0, word 1 equal to 1, and so on. Address 44 therefore contains word 11.
 
-Simultaneous requests use round-robin priority, initially core 0. The bus
-waits for each granted processor access to finish before the next grant.
-A competing upgrade that lost its shared copy retries with BusRdX. Dirty
-evictions still use the ordinary word-by-word write-back path.
-Dirty lines are not automatically flushed at termination.
+1. **The processor asks its data cache for address 44.** It sets the address and operation, increments the request ID, and waits for the matching response ID. The cache looks for the 16-byte block starting at address 32. Neither cache holds it yet.
+2. **Core 0 gets the block.** Its cache issues `BusRd` to check the peer. The peer has no copy, so core 0 fetches the words at addresses 32, 36, 40, and 44 through the memory arbiter. It marks the line Exclusive and returns 11. This is one processor miss, even though four words were fetched.
+3. **Core 1 reads address 44.** It also issues `BusRd`. Both copies become Shared. Now either core can read the block locally.
+4. **Core 0 writes 101 to address 44.** Its copy is present, so this is a hit. It still needs permission to write. Its `BusUpgr` invalidates core 1’s copy, then core 0 stores 101 and marks its own line Modified. Memory can still contain 11.
+5. **Core 1 reads again.** Its copy is invalid, so it misses. Core 0 writes the modified block to shared memory before core 1 fetches it. Core 1 receives **101**, and both copies are Shared again.
 
-## Tests
+## How the model is organized
 
-Each core finishes with two reads of address 0. The first brings the block into
-its cache and the second hits, giving one hit and seven misses per core.
+All simulator components live in [main.sitar](main.sitar). Read them in this order to follow the example above.
 
-The default two-core driver first reads address 0 from both caches, then evicts
-that clean line using addresses 32 and 64. Core 0 stores 12345 at address 0 and
-forces a dirty eviction. Core 1 waits for core 0 to finish and reads address 0
-again through a cache miss, asserting that it sees 12345. Both processors check
-every returned value and error, including different word values from the same
-shared memory. This demonstrates shared backing storage without assuming
-coherence. The test uses the default cache geometry and LRU policy.
+| Component | Responsibility |
+|---|---|
+| `Top` | Connects cores and memories, grants coherence requests, checks coherence, and prints totals. |
+| `Core` | Runs three procedures concurrently: the processor, instruction cache, and data cache. Instruction fetches use a private instruction memory. Both data caches use the same physical data addresses. |
+| `Processor` | Generates the chosen access sequence and waits for each response. In the default trace both cores visit addresses 0, 32, and 64. Core 0 writes 12345 to address 0; core 1 later reads it. |
+| `Cache` | Looks up blocks, counts hits and misses, chooses victims, handles MESI requests, and transfers data. The instruction and data caches share this implementation; coherence is enabled on the data caches. |
+| `Arbiter` | Accepts one data-memory word transaction at a time and returns the reply only to the requesting core. |
+| `Memory` | Holds 64 four-byte words. Valid word addresses are 0, 4, …, 252. Checks the operation, alignment, and bounds before accessing data. |
 
-`check.py` runs this shared test with zero and nonzero memory delays. It also
-retains the earlier mixed, locality, streaming, replacement-policy and concurrent
-read tests, using only core 0 for those independent-memory oracle workloads.
-Those regressions exercise multiple cache geometries and delays, invalid inputs,
-dirty eviction, read bypass and exact hit latency. Assertions must stay enabled.
+There are two paths to follow in the source. **Coherence** asks who holds a block and who can write it. The bus logic in `Top` gives simultaneous requests round-robin priority, initially favoring core 0. It lets the granted access finish before granting the next one. If two sharers request upgrades, the losing core may have lost its copy and must retry with `BusRdX`.
 
-## MESI statistics and verification
+**Memory traffic** carries the actual fills and dirty evictions through `data cache → arbiter → shared memory`. The arbiter also uses round-robin priority. It handles individual words, so a whole block transfer is not atomic at this interface. A request occupies 10 bytes (core ID, operation, address, value); a reply occupies 5 bytes (error, value). Error 0 means success, 1 out of bounds, 2 misaligned, and 3 invalid operation. Sitar nets are read in phase 0 and written in phase 1. In the source, `||` runs workers concurrently, `wait` pauses a worker, and code inside dollar signs is C++.
 
-The exit report counts data-cache events for each core and their sum. Hits and
-misses count successful accesses, including extra reads. A shared write that
-keeps its copy during upgrade is a hit. BusRd, BusRdX and BusUpgr count actual
-transactions at the requesting core. An upgrade canceled before snooping does
-not count; its successful BusRdX retry does. Invalidations count valid copies
-lost at the snooped core. Writebacks count entire dirty blocks, both on eviction
-and on intervention.
+## Cache organization, replacement, and writes
 
-A coherence miss is the first successful miss on a block since a peer
-invalidated this core's copy. It is a subset of misses. Cold misses and misses
-after an ordinary eviction have no invalidation marker. This rule tracks
-observed invalidations, without predicting what replacement would have done.
+By default each cache has **2 sets × 2 ways × 16 bytes = 64 bytes**, enough for four of the 16 data-memory blocks. A set is the group where a block is allowed to live; a way is one slot in that group. The set index is `(address / BLOCK_SIZE) % NUM_SETS` using integer division. For example, blocks starting at 0, 32, and 64 all compete for the same two slots.
 
-With assertions enabled, completed data operations check both caches against
-an independent record of the latest stores. Two valid copies must both be
-Shared. Every valid word must match the reference and memory must match
-unless a Modified owner exists. Extra read hits check the returned word at
-lookup, when the read samples its data.
+On a miss the cache uses an invalid slot in the target set first. If the set is full, LRU removes the least recently accessed block, FIFO removes the earliest inserted block, and Random chooses a way in that set. On a write miss, the cache fetches the block and then writes into it (**write-allocate**).
+
+| MESI state | Meaning and behavior |
+|---|---|
+| Invalid (I) | No usable copy. A read miss issues `BusRd`; a write miss issues `BusRdX` to obtain ownership and invalidate peer copies. |
+| Exclusive (E) | The only cached copy, matching memory. A local store changes it to M without a bus request. |
+| Shared (S) | Clean copy that another cache may hold. Before writing, issue `BusUpgr` to invalidate the peer. |
+| Modified (M) | The sole owner of the latest data. Local reads and writes stay in M. Before giving the block to a peer or evicting it, preserve its latest contents in memory. |
+
+**Write-back** means a store can finish before main memory receives the new value. A dirty eviction writes each word and waits for its acknowledgement before reusing the line. A clean E or S line can be discarded. When a peer requests modified data, the snoop handler copies the entire block to shared memory atomically in this model. Dirty lines can remain cached when simulation ends. This version has no write-through mode.
+
+The cache also supports one extra read. During dirty eviction it can serve a hit on a different resident block. A read of the victim or a miss needing memory must wait. The concurrent-read fixture compares this behavior with blocking enabled.
+
+To change cache geometry, edit the structural parameters `NUM_SETS`, `NUM_WAYS`, and `BLOCK_SIZE` in `Cache` and rebuild. They must be powers of two; block size is 4–256 bytes. Edit `CACHE_DELAY` and `MEM_DELAY` assignments in `Top` to change timing. The default gives core 0 zero cache delay and core 1 one cycle, so identical hits can have different latencies. Phase and bus waits can still take time when a configured delay is zero.
+
+## Read the trace and statistics
+
+An entry such as `ACCESS core=0 id=3 address=152 hit=1 write=0 error=0 ticks=0` is core 0’s third completed request: a successful read hit at byte address 152. `ticks` measures latency in simulator ticks (two per cycle). `WRITEBACK_START` and `WRITEBACK` bracket a dirty eviction. At exit, `DATA CACHE` rows report each core and their sum.
+
+| Counter | What counts |
+|---|---|
+| `hits`, `misses` | Successful data accesses, including extra reads. An upgrade that retains its copy is a hit. Hit rate = hits / (hits + misses). |
+| `BusRd`, `BusRdX`, `BusUpgr` | Granted coherence transactions for a read, a write needing a copy, or a write upgrading a shared copy. A canceled upgrade is excluded; its granted retry counts. |
+| `invalidations` | Valid copies lost to a peer’s request, charged to the core that lost the copy. |
+| `writebacks` | Whole dirty blocks written to memory on eviction or intervention, charged to the core supplying the data. |
+| `coherence_misses` | First successful miss on a block since a peer invalidated this core’s copy. This is a subset of misses. Cold misses and ordinary replacement misses do not qualify. |
+
+For a partial run, use the completed hits and misses as the denominator. A granted bus request may still be in progress at the cutoff. The fixed trace with default geometry and LRU expects one hit and seven misses per core; generated workloads and other policies can give different results.
+
+## Automated verification
+
+Run from this directory with Python 3 and the Sitar toolchain available. Keep assertions enabled.
+
+```sh
+python3 check.py
+```
+
+The checker builds temporary variants of the model, compiles them, and runs controlled workloads. Some replace the normal processor with a test processor; the snoop test drives the two caches directly. The source in your project directory stays intact. During simulation, completed data operations check valid cached words against an independent record of stores. If both cores hold a block, both must be Shared. Memory must match the reference unless a Modified owner exists.
+
+## File guide
+
+| File | What you use it for |
+|---|---|
+| [main.sitar](main.sitar) | The complete model, default workloads, actual replacement policies, and statistics. Build this file for a normal run. |
+| [check.py](check.py) | Runs regressions for coherence, cache geometry, delays, errors, locality, replacement, read overlap, and counter totals. |
+| [mixed.sitar](mixed.sitar) | Test processor that issues instruction and data requests together and checks data, errors, and timing. |
+| [lru.sitar](lru.sitar), [fifo.sitar](fifo.sitar) | Test processors that exercise the expected replacement order and dirty eviction. The policy implementations themselves are in the cache. |
+| [concurrent.sitar](concurrent.sitar) | Exercises an extra read during write-back and measures execution time with and without read overlap. |
+| [snoop.sitar](snoop.sitar) | Deterministic two-core trace for shared reads, intervention, alternating writes, simultaneous requests, and eviction or reuse of lines in all four MESI states. |
+| [Assignment handout](<A1 Proc-Mem Models (Sitar Users’ Group).pdf>) | Original requirements. Q1–Q4 are compulsory and Q5–Q10 are bonus work. |
+| [Simulation notes](<Sitar Cache Simulation Notes.docx>) | Worked examples and notes on the two-core extension. Both documents are local reference files ignored by Git. |
+| `Output/`, `sitar_sim` | Generated C++ headers, sources, object files, and the compiled executable. Edit the Sitar source and rebuild to change the simulator. |
+| `sitar_scons_config.txt`, `.sconsign.dblite`, `.gitignore` | Local build configuration, SCons build records, and Git’s list of files to exclude. |
