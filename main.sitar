@@ -67,7 +67,12 @@ module Top
                     assert(cache->line_word(set, way, addr % cache->block_bytes) == expected[word]);
                     modified |= state == State::M;
                 }
-                assert(modified || data_memory.words[word] == expected[word]);
+                // Memory may have serviced a write whose acknowledgement is still in flight.
+                bool awaiting_ack = false;
+                for (auto* c : {&a, &b})
+                    if (c->through_pending && c->saved_address == addr)
+                        awaiting_ack |= data_memory.words[word] == c->saved_data;
+                assert(modified || data_memory.words[word] == expected[word] || awaiting_ack);
             }
         }
     $
@@ -76,20 +81,21 @@ module Top
         // the run at the cycle limit before either processor reaches done.
         static Top* model = this;
         std::atexit([] {
-            const char* names[] = {"hits","misses","BusRd","BusRdX","BusUpgr","invalidations","writebacks","coherence_misses"};
-            uint64_t totals[8] = {};
+            const char* names[] = {"hits","misses","BusRd","BusRdX","BusUpgr","invalidations","writebacks","coherence_misses","memory_write_bytes"};
+            uint64_t totals[9] = {};
             for (auto* c : {&model->core.data_cache, &model->core1.data_cache}) {
                 uint64_t row[] = {c->hits,c->misses,c->grants[0],c->grants[1],c->grants[2],
-                                  c->invalidations,c->writebacks,c->coherence_misses};
+                                  c->invalidations,c->writebacks,c->coherence_misses,
+                                  model->data_memory.write_bytes[c->core_id] + c->intervention_bytes};
                 std::cout << "DATA CACHE core=" << int(c->core_id);
-                for (int i = 0; i < 8; ++i) {
+                for (int i = 0; i < 9; ++i) {
                     std::cout << " " << names[i] << "=" << row[i];
                     totals[i] += row[i];
                 }
                 std::cout << '\n';
             }
             std::cout << "DATA CACHE total";
-            for (int i = 0; i < 8; ++i) std::cout << " " << names[i] << "=" << totals[i];
+            for (int i = 0; i < 9; ++i) std::cout << " " << names[i] << "=" << totals[i];
             std::cout << '\n';
         });
         for (unsigned i = 0; i < 64; ++i) expected[i] = i;
@@ -108,6 +114,12 @@ module Top
         core1.data_cache.CACHE_DELAY = 1;
         instruction_memory1.MEM_DELAY = 1;
 
+        if (const char* setting = std::getenv("SITAR_WRITE_POLICY")) {
+            std::string name(setting);
+            if (name != "write-back" && name != "write-through")
+                throw std::runtime_error("SITAR_WRITE_POLICY must be write-back or write-through");
+            core.data_cache.write_through = core1.data_cache.write_through = name == "write-through";
+        }
         if (const char* setting = std::getenv("SITAR_POLICY")) {
             std::string name(setting);
             Cache<>::ReplacementPolicy policy;
@@ -291,6 +303,8 @@ procedure Cache
         bool invalidated[256 / BLOCK_SIZE] = {};
         uint32_t* expected_words = nullptr;
         std::function<void()> verify;
+        bool write_through = false, through_pending = false;
+        uint64_t intervention_bytes = 0;
         bool coherent = false;  // Only private data caches share this bus.
         bool bus_pending = false;
         bool bus_retry = false;  // A queued upgrade lost its shared copy.
@@ -324,6 +338,7 @@ procedure Cache
                 for (int pos = 0; pos < BLOCK_SIZE; pos += 4)
                     memory_words[(req.block + pos) / 4] = line_word(set, found, pos);
                 writebacks++;
+                intervention_bytes += BLOCK_SIZE;
             }
 
             // Two readers can share a block. A writer needs the peer to drop it.
@@ -498,10 +513,24 @@ procedure Cache
                         }$;
                     end if;
 
-                    // 6. Apply a store to the cached copy and mark it for a later write-back.
+                    // Hold exclusive ownership until memory acknowledges the write-through store.
+                    if (not error and saved_write and write_through) then
+                        $through_pending = true;
+                        sitar::pack(request_token, core_id, uint8_t(1), saved_address, saved_data);
+                        sent = false;$;
+                        do
+                            wait until (this_phase == 1);
+                            $sent = memory_request->push(request_token);$;
+                            if (not sent) then wait; end if;
+                        while (not sent) end do;
+                        wait until (this_phase == 0 and $memory_response->peek(response_token)$);
+                        $memory_response->pull(response_token);
+                        sitar::unpack(response_token, error, read_data);
+                        through_pending = false;$;
+                    end if;
                     $if (!error && saved_write) {
                         save_word(offset, saved_data);
-                        mesi[slot][way] = MesiState::M;
+                        mesi[slot][way] = write_through ? MesiState::E : MesiState::M;
                     }
                     // LRU policy: update ranks on every successful access, including hits.
                     // FIFO policy: update ranks only on insertion (a miss); hits keep their place.
@@ -613,7 +642,7 @@ procedure Processor
                 if (index == 7) assert(data_cache->hit);
                 index++;$;
             while (index < 8) end do;
-            $assert(data_cache->replacement_policy == Cache<>::RANDOM || data_cache->core_id == 1 || data_cache->writebacks == 1);
+            $assert(data_cache->replacement_policy == Cache<>::RANDOM || data_cache->core_id == 1 || data_cache->writebacks == (data_cache->write_through ? 0u : 1u));
             log << endl << "PASS shared core=" << int(data_cache->core_id);$;
         else
             $if (const char* value = std::getenv("SITAR_SEED")) {
@@ -658,6 +687,7 @@ module Memory
         uint8_t core_id = 0, request_core;
         int MEM_DELAY = 0;
         uint32_t words[64], address, value;
+        uint64_t write_bytes[2] = {};
         uint8_t write, error;
         bool sent;
         token<10> request_token;
@@ -678,7 +708,7 @@ module Memory
             // Validate before indexing memory; invalid requests return an error and zero.
             error = write > 1 ? 3 : address % 4 ? 2 : address > 252 ? 1 : 0;
             if (!error) {
-                if (write) words[address/4]=value;
+                if (write) { words[address/4]=value; write_bytes[request_core] += 4; }
                 value = words[address/4];
             } else value=0;
             // Package the error code and value into a reply.

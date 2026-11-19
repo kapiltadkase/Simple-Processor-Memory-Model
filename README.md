@@ -24,19 +24,27 @@ SITAR_WORKLOAD=locality SITAR_SEED=42 SITAR_POLICY=fifo   ./sitar_sim 100000
 SITAR_WORKLOAD=locality SITAR_SEED=42 SITAR_POLICY=random ./sitar_sim 100000
 ```
 
+To compare write policies on the same workload and replacement policy:
+
+```sh
+SITAR_WRITE_POLICY=write-back    SITAR_POLICY=lru SITAR_WORKLOAD=locality SITAR_SEED=42 ./sitar_sim 100000
+SITAR_WRITE_POLICY=write-through SITAR_POLICY=lru SITAR_WORKLOAD=locality SITAR_SEED=42 ./sitar_sim 100000
+```
+
 To compare address patterns, keep the policy and seed fixed and change `SITAR_WORKLOAD=locality` to `SITAR_WORKLOAD=uniform`. These settings use the same binary.
 
 | Setting | Choices and meaning |
 |---|---|
 | `SITAR_WORKLOAD` | `fixed` (default) runs eight predictable data accesses per core. `uniform` samples all 64 words. `locality` chooses from the first eight words with 75% probability and from all 64 otherwise. Both cores use the same hot region. |
 | `SITAR_POLICY` | `lru` (default), `fifo`, or `random`. Applies to both **data** caches. |
+| `SITAR_WRITE_POLICY` | `write-back` (default) or `write-through`. Both data caches use the same mode, with write-allocate and coherence in either mode. |
 | `SITAR_SEED` | Unsigned 32-bit workload seed, default 42. Each core gets its own repeatable stream. Random replacement uses a separate, fixed generator seed. |
 
 Uniform and locality each issue 256 accesses per core, with a 25% chance of a store per access. The current locality generator uses a fixed hot region; it has no separate spatial and temporal locality settings. At the cycle limit, the simulator prints statistics even if the workload is unfinished. For a complete generated workload look for `PASS two_cores=2` and 512 total hits plus misses.
 
 ## Follow one request
 
-Start with a cold cache and a read of byte address 44. Memory starts with word 0 equal to 0, word 1 equal to 1, and so on. Address 44 therefore contains word 11.
+Using the default write-back mode, start with a cold cache and a read of byte address 44. Memory starts with word 0 equal to 0, word 1 equal to 1, and so on. Address 44 therefore contains word 11.
 
 1. **The processor asks its data cache for address 44.** It sets the address and operation, increments the request ID, and waits for the matching response ID. The cache looks for the 16-byte block starting at address 32. Neither cache holds it yet.
 2. **Core 0 gets the block.** Its cache issues `BusRd` to check the peer. The peer has no copy, so core 0 fetches the words at addresses 32, 36, 40, and 44 through the memory arbiter. It marks the line Exclusive and returns 11. This is one processor miss, even though four words were fetched.
@@ -70,11 +78,13 @@ On a miss the cache uses an invalid slot in the target set first. If the set is 
 | MESI state | Meaning and behavior |
 |---|---|
 | Invalid (I) | No usable copy. A read miss issues `BusRd`; a write miss issues `BusRdX` to obtain ownership and invalidate peer copies. |
-| Exclusive (E) | The only cached copy, matching memory. A local store changes it to M without a bus request. |
+| Exclusive (E) | The only cached copy, matching memory. A local store needs no coherence transaction. It ends in M for write-back or E for write-through. |
 | Shared (S) | Clean copy that another cache may hold. Before writing, issue `BusUpgr` to invalidate the peer. |
 | Modified (M) | The sole owner of the latest data. Local reads and writes stay in M. Before giving the block to a peer or evicting it, preserve its latest contents in memory. |
 
-**Write-back** means a store can finish before main memory receives the new value. A dirty eviction writes each word and waits for its acknowledgement before reusing the line. A clean E or S line can be discarded. When a peer requests modified data, the snoop handler copies the entire block to shared memory atomically in this model. Dirty lines can remain cached when simulation ends. This version has no write-through mode.
+**Write-back** means a store can finish before main memory receives the new value. A dirty eviction writes each word and waits for its acknowledgement before reusing the line. A clean E or S line can be discarded. When a peer requests modified data, the snoop handler copies the entire block to shared memory atomically in this model. Dirty lines can remain cached when simulation ends.
+
+**Write-through** obtains the same ownership permissions and invalidates peer copies before writing. Every successful store sends one four-byte word through the memory arbiter and waits for acknowledgement before completing. The writer keeps a clean Exclusive copy, so its eviction needs no dirty write-back. There is no write buffer.
 
 The cache also supports one extra read. During dirty eviction it can serve a hit on a different resident block. A read of the victim or a miss needing memory must wait. The concurrent-read fixture compares this behavior with blocking enabled.
 
@@ -90,6 +100,7 @@ An entry such as `ACCESS core=0 id=3 address=152 hit=1 write=0 error=0 ticks=0` 
 | `BusRd`, `BusRdX`, `BusUpgr` | Granted coherence transactions for a read, a write needing a copy, or a write upgrading a shared copy. A canceled upgrade is excluded; its granted retry counts. |
 | `invalidations` | Valid copies lost to a peer’s request, charged to the core that lost the copy. |
 | `writebacks` | Whole dirty blocks written to memory on eviction or intervention, charged to the core supplying the data. |
+| `memory_write_bytes` | Data bytes written to shared memory, attributed to the writing core. Includes dirty evictions, snoop interventions, and individual write-through stores. Compare this counter and the simulation stop time on completed runs. |
 | `coherence_misses` | First successful miss on a block since a peer invalidated this core’s copy. This is a subset of misses. Cold misses and ordinary replacement misses do not qualify. |
 
 For a partial run, use the completed hits and misses as the denominator. A granted bus request may still be in progress at the cutoff. The fixed trace with default geometry and LRU expects one hit and seven misses per core; generated workloads and other policies can give different results.

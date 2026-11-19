@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 
 os.environ.pop('SITAR_POLICY', None)  # Each regression selects its own policy.
+os.environ.pop('SITAR_WRITE_POLICY', None)
 shared_source = Path(__file__).with_name('main.sitar').read_text()
 source = re.sub(r'procedure Processor\n.*?end procedure', lambda _: Path(__file__).with_name('mixed.sitar').read_text(), shared_source, flags=re.S)
 source = re.sub(r'^.*peer_done.*\n', '', source, flags=re.M)
@@ -25,8 +26,8 @@ with tempfile.TemporaryDirectory() as directory:
     assert 'PASS snoop' in result.stdout, result.stdout
     print('PASS snoop: broadcast, arbitration and dirty intervention')
     rows = [line for line in result.stdout.splitlines() if line.startswith('DATA CACHE')]
-    fields = ('hits', 'misses', 'BusRd', 'BusRdX', 'BusUpgr', 'invalidations', 'writebacks', 'coherence_misses')
-    expected = [(7,12,8,4,1,6,6,3), (1,9,4,5,1,4,4,4)]
+    fields = ('hits', 'misses', 'BusRd', 'BusRdX', 'BusUpgr', 'invalidations', 'writebacks', 'coherence_misses', 'memory_write_bytes')
+    expected = [(7,12,8,4,1,6,6,3,96), (1,9,4,5,1,4,4,4,64)]
     expected.append(tuple(map(sum, zip(*expected))))
     assert len(rows) == 3, rows
     for label, row, values in zip(('core=0', 'core=1', 'total'), rows, expected):
@@ -113,12 +114,18 @@ for delay in (0, 3):
             result = subprocess.run(command, cwd=directory, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
             assert result.returncode == 0 and 'FAILURE' not in result.stdout, result.stdout
         for policy, workload in [('lru', 'fixed'), ('lru', 'locality'), ('fifo', 'locality'), ('random', 'locality')]:
-            result = subprocess.run(['./sitar_sim', '100000'], cwd=directory, text=True,
-                                    capture_output=True, env={**os.environ, 'SITAR_POLICY': policy, 'SITAR_WORKLOAD': workload, 'SITAR_SEED': '42'})
-            assert result.returncode == 0 and 'PASS two_cores=2' in result.stdout, result.stdout + result.stderr
-            if workload == 'fixed':
-                assert all(f'PASS shared core={i}' in result.stdout for i in (0, 1)), result.stdout
-            else:
-                counts = re.findall(r'DATA CACHE core=[01] hits=(\d+) misses=(\d+)', result.stdout)
-                assert len(counts) == 2 and all(int(h) + int(m) == 256 for h, m in counts), counts
-            print(f'PASS two cores: policy={policy} delay={delay} workload={workload}')
+            for write_policy in ('write-back', 'write-through'):
+                result = subprocess.run(['./sitar_sim', '100000'], cwd=directory, text=True,
+                                        capture_output=True, env={**os.environ, 'SITAR_POLICY': policy, 'SITAR_WRITE_POLICY': write_policy, 'SITAR_WORKLOAD': workload, 'SITAR_SEED': '42'})
+                assert result.returncode == 0 and 'PASS two_cores=2' in result.stdout, result.stdout + result.stderr
+                if workload == 'fixed':
+                    assert all(f'PASS shared core={i}' in result.stdout for i in (0, 1)), result.stdout
+                else:
+                    counts = re.findall(r'DATA CACHE core=[01] hits=(\d+) misses=(\d+)', result.stdout)
+                    assert len(counts) == 2 and all(int(h) + int(m) == 256 for h, m in counts), counts
+                if write_policy == 'write-through':
+                    for core in (0, 1):
+                        stores = len(re.findall(rf'ACCESS core={core} .*? write=1 error=0', result.stdout))
+                        row = next(r for r in result.stdout.splitlines() if r.startswith(f'DATA CACHE core={core} '))
+                        assert ' writebacks=0 ' in row and row.endswith(f' memory_write_bytes={4 * stores}'), row
+                print(f'PASS two cores: write={write_policy} policy={policy} delay={delay} workload={workload}')
