@@ -85,3 +85,24 @@ retains the earlier mixed, locality, streaming, replacement-policy and concurren
 read tests, using only core 0 for those independent-memory oracle workloads.
 Those regressions exercise multiple cache geometries and delays, invalid inputs,
 dirty eviction, read bypass and exact hit latency. Assertions must stay enabled.
+
+## MESI statistics and verification
+
+The exit report counts data-cache events for each core and their sum. Hits and
+misses count successful accesses, including extra reads. A shared write that
+keeps its copy during upgrade is a hit. BusRd, BusRdX and BusUpgr count actual
+transactions at the requesting core. An upgrade canceled before snooping does
+not count; its successful BusRdX retry does. Invalidations count valid copies
+lost at the snooped core. Writebacks count entire dirty blocks, both on eviction
+and on intervention.
+
+A coherence miss is the first successful miss on a block since a peer
+invalidated this core's copy. It is a subset of misses. Cold misses and misses
+after an ordinary eviction have no invalidation marker. This rule tracks
+observed invalidations, without predicting what replacement would have done.
+
+With assertions enabled, completed data operations check both caches against
+an independent record of the latest stores. Two valid copies must both be
+Shared. Every valid word must match the reference and memory must match
+unless a Modified owner exists. Extra read hits check the returned word at
+lookup, when the read samples its data.

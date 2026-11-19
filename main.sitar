@@ -49,21 +49,54 @@ module Top
     decl $
         // When both cores ask together, this core goes first.
         int next_snoop = 0;
+        uint32_t expected[64];
+        void verify_data() {
+            auto& a = core.data_cache;
+            auto& b = core1.data_cache;
+            using State = Cache<>::MesiState;
+            for (unsigned word = 0; word < 64; ++word) {
+                unsigned addr = word * 4;
+                int aw = a.find_way(addr), bw = b.find_way(addr);
+                bool modified = false;
+                for (auto* cache : {&a, &b}) {
+                    int way = cache == &a ? aw : bw;
+                    if (way < 0) continue;
+                    int set = addr / cache->block_bytes % cache->set_count;
+                    auto state = cache->mesi_state(set, way);
+                    assert(aw < 0 || bw < 0 || state == State::S);
+                    assert(cache->line_word(set, way, addr % cache->block_bytes) == expected[word]);
+                    modified |= state == State::M;
+                }
+                assert(modified || data_memory.words[word] == expected[word]);
+            }
+        }
     $
     init $
         // Sitar's driver owns Top for the lifetime of the process. It can end
         // the run at the cycle limit before either processor reaches done.
         static Top* model = this;
         std::atexit([] {
-            uint64_t total_hits = 0, total_misses = 0;
-            for (auto* cache : {&model->core.data_cache, &model->core1.data_cache}) {
-                std::cout << "DATA CACHE core=" << int(cache->core_id)
-                          << " hits=" << cache->hits << " misses=" << cache->misses << '\n';
-                total_hits += cache->hits;
-                total_misses += cache->misses;
+            const char* names[] = {"hits","misses","BusRd","BusRdX","BusUpgr","invalidations","writebacks","coherence_misses"};
+            uint64_t totals[8] = {};
+            for (auto* c : {&model->core.data_cache, &model->core1.data_cache}) {
+                uint64_t row[] = {c->hits,c->misses,c->grants[0],c->grants[1],c->grants[2],
+                                  c->invalidations,c->writebacks,c->coherence_misses};
+                std::cout << "DATA CACHE core=" << int(c->core_id);
+                for (int i = 0; i < 8; ++i) {
+                    std::cout << " " << names[i] << "=" << row[i];
+                    totals[i] += row[i];
+                }
+                std::cout << '\n';
             }
-            std::cout << "DATA CACHE total hits=" << total_hits << " misses=" << total_misses << '\n';
+            std::cout << "DATA CACHE total";
+            for (int i = 0; i < 8; ++i) std::cout << " " << names[i] << "=" << totals[i];
+            std::cout << '\n';
         });
+        for (unsigned i = 0; i < 64; ++i) expected[i] = i;
+        for (auto* cache : {&core.data_cache, &core1.data_cache}) {
+            cache->expected_words = expected;
+            cache->verify = [this] { verify_data(); };
+        }
         core.instruction_cache.core_id = 0;
         core.data_cache.core_id = 0;
         core1.instruction_cache.core_id = 1;
@@ -107,6 +140,7 @@ module Top
                     requester.bus_retry = requester.bus_request.op == Cache<>::BusUpgr &&
                                           !requester.is_shared(requester.bus_request.block);
                     if (!requester.bus_retry) {
+                        requester.grants[requester.bus_request.op]++;
                         requester.peer_state = peer.snoop(requester.bus_request, data_memory.words);
                     }
 
@@ -160,6 +194,7 @@ procedure Cache
     include $
         #include <cassert>
         #include <stdexcept>
+        #include <functional>
         #include <random>
     $
     decl $
@@ -247,6 +282,11 @@ procedure Cache
 
         BusRequest bus_request{};
         uint64_t bus_requests = 0;
+        uint64_t grants[3] = {}, invalidations = 0, coherence_misses = 0;
+        static constexpr int block_bytes = BLOCK_SIZE, set_count = NUM_SETS;
+        bool invalidated[256 / BLOCK_SIZE] = {};
+        uint32_t* expected_words = nullptr;
+        std::function<void()> verify;
         bool coherent = false;  // Only private data caches share this bus.
         bool bus_pending = false;
         bool bus_retry = false;  // A queued upgrade lost its shared copy.
@@ -284,6 +324,10 @@ procedure Cache
 
             // Two readers can share a block. A writer needs the peer to drop it.
             mesi[set][found] = req.op == BusRd ? MesiState::S : MesiState::I;
+            if (req.op != BusRd) {
+                invalidations++;
+                invalidated[req.block / BLOCK_SIZE] = true;
+            }
             return prior;
         }
 
@@ -467,11 +511,20 @@ procedure Cache
                 // 7. Publish the result so the processor knows this request is finished.
                 if (!error) {
                     if (hit) hits++;
-                    else misses++;
+                    else {
+                        misses++;
+                        if (invalidated[base / BLOCK_SIZE]) coherence_misses++;
+                        invalidated[base / BLOCK_SIZE] = false;
+                    }
+                    if (expected_words) {
+                        if (saved_write) expected_words[saved_address / 4] = saved_data;
+                        assert(read_data == expected_words[saved_address / 4]);
+                    }
                 }
                 finish_time = current_time.toUint64();
                 busy = false;
                 response_id = active_id;
+                if (verify) verify();
                 log << endl << "ACCESS core=" << int(core_id) << " id=" << response_id << " address=" << saved_address
                     << " hit=" << hit << " write=" << int(saved_write)
                     << " error=" << int(error) << " ticks=" << finish_time-start_time;
@@ -494,6 +547,7 @@ procedure Cache
                     // LRU policy for extra read hits: refresh recency; FIFO keeps insertion order.
                     if (replacement_policy == LRU) touch(read_slot, read_way);
                     if (writing) overlap_hits++;
+                    if (expected_words) assert(read_value == expected_words[read_address/4]);
                 }$;
                 if (not read_error and read_way < 0) then
                     // This read is missing from the cache: let the ordinary worker fetch it.
@@ -510,6 +564,7 @@ procedure Cache
                 $if (!read_error && read_way >= 0) hits++;
                 read_finish=current_time.toUint64();
                 read_response = read_request;
+                if (verify) verify();
                 log << endl << "READ_COMPLETE core=" << int(core_id) << " address=" << read_address << " value=" << read_value
                     << " writing=" << writing << " finish=" << current_time;$;
             while (1) end do;

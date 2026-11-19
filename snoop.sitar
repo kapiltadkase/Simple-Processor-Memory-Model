@@ -7,6 +7,7 @@ decl $
     using State = Cache<>::MesiState;
     int step_index = 0;
     int eviction_index = 0;
+    int alternating_store = 0;
     // Core, byte address, write flag, value. All addresses map to set 1.
     const int evictions[9][4] = {
         {0,48,1,701}, {0,52,1,702}, {0,80,0,0}, {1,80,1,703},
@@ -138,4 +139,18 @@ do
         eviction_index++;
     $;
 while ($eviction_index < 9$) end do;
+// Core 1 still owns modified block 44. Transfer ownership on every store.
+do
+    $
+        auto& writer = alternating_store % 2 ? core1.data_cache : core.data_cache;
+        writer.address = 44;
+        writer.write = 1;
+        writer.write_data = 501 + alternating_store;
+        writer.request_id++;
+    $;
+    wait until ($core.data_cache.request_id == core.data_cache.response_id &&
+                 core1.data_cache.request_id == core1.data_cache.response_id$);
+    $assert(data_memory.words[11] == (alternating_store ? 500u + alternating_store : 402u));
+    alternating_store++;$;
+while ($alternating_store < 4$) end do;
 $log << endl << "PASS snoop";$;

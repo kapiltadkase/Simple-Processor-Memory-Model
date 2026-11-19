@@ -1,5 +1,6 @@
 """Check cache regressions and shared two-core backing memory."""
 from pathlib import Path
+import os
 import re
 import subprocess
 import tempfile
@@ -22,6 +23,15 @@ with tempfile.TemporaryDirectory() as directory:
         assert result.returncode == 0 and 'FAILURE' not in result.stdout, result.stdout
     assert 'PASS snoop' in result.stdout, result.stdout
     print('PASS snoop: broadcast, arbitration and dirty intervention')
+    rows = [line for line in result.stdout.splitlines() if line.startswith('DATA CACHE')]
+    fields = ('hits', 'misses', 'BusRd', 'BusRdX', 'BusUpgr', 'invalidations', 'writebacks', 'coherence_misses')
+    expected = [(7,12,8,4,1,6,6,3), (1,9,4,5,1,4,4,4)]
+    expected.append(tuple(map(sum, zip(*expected))))
+    assert len(rows) == 3, rows
+    for label, row, values in zip(('core=0', 'core=1', 'total'), rows, expected):
+        assert row == 'DATA CACHE ' + label + ' ' + ' '.join(
+            f'{name}={value}' for name, value in zip(fields, values)), row
+    print('\n'.join(rows))
 
 for sets, ways, block, cache_delay, memory_delay, mode in [
     (4, 1, 16, 0, 0, "mixed"), (2, 2, 16, 0, 0, "mixed"), (1, 4, 16, 0, 0, "mixed"),
@@ -93,12 +103,22 @@ for policy in ("LRU", "FIFO"):
         assert f'PASS {policy}' in result.stdout, result.stdout
         print(f'PASS {policy}: replacement order and dirty eviction')
 
-# Both private caches read one physical address; core 1 observes core 0's eviction.
-for delay in (0, 3):
+# Run both processors against the same repeatable address streams for every policy.
+for delay, policy in [(0, 'LRU'), (3, 'LRU'), (0, 'FIFO'), (0, 'RANDOM')]:
     with tempfile.TemporaryDirectory() as directory:
-        Path(directory, 'main.sitar').write_text(shared_source.replace('.MEM_DELAY = 0', f'.MEM_DELAY = {delay}'))
-        for command in [['sitar', 'translate', 'main.sitar'], ['sitar', 'compile'], ['./sitar_sim', '10000']]:
+        model = shared_source.replace('.MEM_DELAY = 0', f'.MEM_DELAY = {delay}')
+        model = model.replace('replacement_policy = LRU', f'replacement_policy = {policy}')
+        Path(directory, 'main.sitar').write_text(model)
+        for command in [['sitar', 'translate', 'main.sitar'], ['sitar', 'compile']]:
             result = subprocess.run(command, cwd=directory, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
             assert result.returncode == 0 and 'FAILURE' not in result.stdout, result.stdout
-        assert 'PASS shared core=0' in result.stdout and 'PASS shared core=1' in result.stdout, result.stdout
-        print(f'PASS shared memory delay={delay}')
+        for workload in (('fixed', 'locality') if policy == 'LRU' else ('locality',)):
+            result = subprocess.run(['./sitar_sim', '100000'], cwd=directory, text=True,
+                                    capture_output=True, env={**os.environ, 'SITAR_WORKLOAD': workload, 'SITAR_SEED': '42'})
+            assert result.returncode == 0 and 'PASS two_cores=2' in result.stdout, result.stdout + result.stderr
+            if workload == 'fixed':
+                assert all(f'PASS shared core={i}' in result.stdout for i in (0, 1)), result.stdout
+            else:
+                counts = re.findall(r'DATA CACHE core=[01] hits=(\d+) misses=(\d+)', result.stdout)
+                assert len(counts) == 2 and all(int(h) + int(m) == 256 for h, m in counts), counts
+            print(f'PASS two cores: policy={policy} delay={delay} workload={workload}')
