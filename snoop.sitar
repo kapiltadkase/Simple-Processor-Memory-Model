@@ -6,6 +6,14 @@ decl $
     };
     using State = Cache<>::MesiState;
     int step_index = 0;
+    int eviction_index = 0;
+    // Core, byte address, write flag, value. All addresses map to set 1.
+    const int evictions[9][4] = {
+        {0,48,1,701}, {0,52,1,702}, {0,80,0,0}, {1,80,1,703},
+        {0,112,0,0}, {0,144,0,0}, {0,176,0,0}, {1,144,0,0}, {0,208,0,0}
+    };
+    uint64_t initial_writebacks;
+    int invalidated_way;
     const Step steps[10] = {
         {0, 0, 0, 11, {State::E, State::I}, {1, 0}},
         {0, 0, 0, 11, {State::E, State::I}, {1, 0}},
@@ -79,4 +87,55 @@ core1.data_cache.request_id++;$;
 wait until ($core1.data_cache.request_id == core1.data_cache.response_id$);
 $assert(core.data_cache.find_way(16) < 0);
 assert(core1.data_cache.mesi_state(1, core1.data_cache.find_way(16)) == State::M);
-log << endl << "PASS snoop";$;
+initial_writebacks = core.data_cache.writebacks;$;
+
+// Keep the shared line at address 0 in the other set throughout.
+do
+    $
+        const int* access = evictions[eviction_index];
+        auto& cache = access[0] ? core1.data_cache : core.data_cache;
+        cache.address = access[1];
+        cache.write = access[2];
+        cache.write_data = access[3];
+        cache.request_id++;
+    $;
+    wait until ($core.data_cache.request_id == core.data_cache.response_id &&
+                 core1.data_cache.request_id == core1.data_cache.response_id$);
+    $
+        auto& cache = core.data_cache;
+        assert(cache.is_shared(0));
+        assert(cache.writebacks == initial_writebacks + (eviction_index >= 5));
+        switch (eviction_index) {
+        case 2:
+            invalidated_way = cache.find_way(80);
+            assert(cache.mesi_state(1, invalidated_way) == State::E);
+            break;
+        case 3:
+            assert(cache.mesi_state(1, invalidated_way) == State::I);
+            break;
+        case 4: // I: reuse the invalid way, preserving the older modified line.
+            assert(cache.find_way(112) == invalidated_way);
+            assert(cache.mesi_state(1, invalidated_way) == State::E);
+            assert(cache.mesi_state(1, cache.find_way(48)) == State::M);
+            assert(data_memory.words[12] == 12 && data_memory.words[13] == 13);
+            break;
+        case 5: // M: both changed words reach memory before the way is reused.
+            assert(cache.find_way(48) < 0);
+            assert(data_memory.words[12] == 701 && data_memory.words[13] == 702);
+            assert(cache.mesi_state(1, cache.find_way(144)) == State::E);
+            break;
+        case 6: // E: discard the clean line.
+            assert(cache.find_way(112) < 0 && cache.find_way(176) == invalidated_way);
+            break;
+        case 7:
+            assert(cache.is_shared(144) && core1.data_cache.is_shared(144));
+            break;
+        case 8: // S: discard only this core's copy.
+            assert(cache.find_way(144) < 0 && core1.data_cache.is_shared(144));
+            assert(cache.mesi_state(1, cache.find_way(208)) == State::E);
+            break;
+        }
+        eviction_index++;
+    $;
+while ($eviction_index < 9$) end do;
+$log << endl << "PASS snoop";$;
