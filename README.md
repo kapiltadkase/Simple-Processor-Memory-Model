@@ -38,9 +38,16 @@ To compare address patterns, keep the policy and seed fixed and change `SITAR_WO
 | `SITAR_WORKLOAD` | `fixed` (default) runs eight predictable data accesses per core. `uniform` samples all 64 words. `locality` chooses from the first eight words with 75% probability and from all 64 otherwise. Both cores use the same hot region. |
 | `SITAR_POLICY` | `lru` (default), `fifo`, or `random`. Applies to both **data** caches. |
 | `SITAR_WRITE_POLICY` | `write-back` (default) or `write-through`. Both data caches use the same mode, with write-allocate and coherence in either mode. |
+| `SITAR_P_STORE` | Probability of a store per generated data access, from `0` (all reads) to `1` (all writes). Default: `0.25`. The fixed workload ignores this setting and keeps its scripted store. |
 | `SITAR_SEED` | Unsigned 32-bit workload seed, default 42. Each core gets its own repeatable stream. Random replacement uses a separate, fixed generator seed. |
 
-Uniform and locality each issue 256 accesses per core, with a 25% chance of a store per access. The current locality generator uses a fixed hot region; it has no separate spatial and temporal locality settings. At the cycle limit, the simulator prints statistics even if the workload is unfinished. For a complete generated workload look for `PASS two_cores=2` and 512 total hits plus misses.
+For a 10% chance of a write per access (90% chance of a read), run:
+
+```sh
+SITAR_WORKLOAD=uniform SITAR_SEED=42 SITAR_P_STORE=0.10 ./sitar_sim 100000
+```
+
+Uniform and locality each issue 256 accesses per core. Keeping workload and seed fixed preserves each core’s address sequence as you vary the write probability. The observed write count can vary around the requested proportion. The current locality generator uses a fixed hot region; it has no separate spatial and temporal locality settings. At the cycle limit, the simulator prints statistics even if the workload is unfinished. For a complete generated workload look for `PASS two_cores=2` and 512 total hits plus misses.
 
 ## Follow one request
 
@@ -71,7 +78,31 @@ There are two paths to follow in the source. **Coherence** asks who holds a bloc
 
 ## Cache organization, replacement, and writes
 
-By default each cache has **2 sets × 2 ways × 16 bytes = 64 bytes**, enough for four of the 16 data-memory blocks. A set is the group where a block is allowed to live; a way is one slot in that group. The set index is `(address / BLOCK_SIZE) % NUM_SETS` using integer division. For example, blocks starting at 0, 32, and 64 all compete for the same two slots.
+By default each cache has **2 sets × 2 ways × 16 bytes = 64 bytes**, enough for four of the 16 data-memory blocks. A set is a group of slots. A way is one slot in that group.
+
+### How an address maps to a cache line
+
+When the trace prints `address=44`, it means **byte address 44** in decimal. Requests carry 32-bit addresses. With 256 bytes of memory and four-byte words, valid word requests start at 0, 4, 8, …, 252. Address 44 is `0x2C` in hexadecimal. Its upper 24 bits are zero, so only the low eight bits are shown below.
+
+```text
+Address 44, default cache geometry
+  001    |    0    |    1100
+   tag      set index   byte offset
+    1           0           12
+```
+
+The low four bits select one of the 16 bytes in a block. The next bit selects one of the two sets. The remaining upper bits form the tag, which identifies the block within that set. For any supported geometry the simulator computes the same fields using integer arithmetic:
+
+| Calculation | Meaning | For address 44 |
+|---|---|---|
+| `block = address / BLOCK_SIZE` | Block number | `44 / 16 = 2` |
+| `set = block % NUM_SETS` | Which set to search | `2 % 2 = 0` |
+| `tag = block / NUM_SETS` | Which tag must match | `2 / 2 = 1` |
+| `offset = address % BLOCK_SIZE` | Byte position in the line | `44 % 16 = 12` |
+
+For a read of 44, the cache checks **both ways of set 0**. A way with tag 1 and a MESI state other than Invalid is a hit: bytes 12–15 of that line hold the requested word. On a miss, the cache chooses a way in set 0 and loads the **whole block**, starting at `block × BLOCK_SIZE = 32`. That fill brings in the words at 32, 36, 40, and 44. A subsequent read of 36 can therefore hit the same line, using offset 4.
+
+**The address determines the set; it does not encode a way.** For example, blocks starting at 0, 32, and 64 all map to set 0 with tags 0, 1, and 2. Only two can fit there at once, even if set 1 is empty.
 
 On a miss the cache uses an invalid slot in the target set first. If the set is full, LRU removes the least recently accessed block, FIFO removes the earliest inserted block, and Random chooses a way in that set. On a write miss, the cache fetches the block and then writes into it (**write-allocate**).
 

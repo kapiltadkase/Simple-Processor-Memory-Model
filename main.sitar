@@ -602,6 +602,7 @@ end procedure
 procedure Processor
     include $
         #include "Cache.h"
+        #include <cerrno>
         #include <cstdlib>
         #include <string>
     $
@@ -614,6 +615,7 @@ procedure Processor
         std::mt19937 rng;
         std::string workload = "fixed";
         uint32_t seed = 42;
+        double p_store = 0.25;
         uint32_t addresses[8] = {0, 32, 64, 0, 32, 64, 0, 0};
     $
     behavior
@@ -649,16 +651,26 @@ procedure Processor
                     throw std::runtime_error("SITAR_SEED must be an unsigned 32-bit integer");
                 seed = std::stoul(digits);
             }
+            if (const char* value = std::getenv("SITAR_P_STORE")) {
+                char* end;
+                errno = 0;
+                p_store = std::strtod(value, &end);
+                if (errno || end == value || *end || !(p_store >= 0 && p_store <= 1))
+                    throw std::runtime_error("SITAR_P_STORE must be a probability from 0 to 1");
+            }
             rng.seed(seed + data_cache->core_id);
             log << endl << "WORKLOAD " << workload << " core=" << int(data_cache->core_id)
-                << " seed=" << seed << " requests=256";$;
+                << " seed=" << seed << " p_store=" << p_store << " requests=256";$;
             do
                 // Both modes use the same random draws. Only the address range changes.
                 $uint32_t word = rng() % 64;
                 bool hot = rng() % 4 != 0;
                 if (workload == "locality" && hot) word %= 8;
                 data_cache->address = 4 * word;
-                data_cache->write = rng() % 4 == 0;
+                uint32_t draw = rng();
+                // Put the low two bits first so p=0.25 preserves the original seeded trace.
+                uint32_t sample = (draw << 30) | (draw >> 2);
+                data_cache->write = sample < p_store * (double(UINT32_MAX) + 1);
                 data_cache->write_data = rng();
                 data_cache->request_id++;$;
                 wait until ($data_cache->request_id == data_cache->response_id$);

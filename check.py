@@ -10,6 +10,7 @@ if not __debug__:
 
 os.environ.pop('SITAR_POLICY', None)  # Each regression selects its own policy.
 os.environ.pop('SITAR_WRITE_POLICY', None)
+os.environ.pop('SITAR_P_STORE', None)
 shared_source = Path(__file__).with_name('main.sitar').read_text()
 source = re.sub(r'procedure Processor\n.*?end procedure', lambda _: Path(__file__).with_name('mixed.sitar').read_text(), shared_source, flags=re.S)
 source = re.sub(r'^.*processor\.peer = .*\n', '', source, flags=re.M)
@@ -160,3 +161,10 @@ for delay, ways, block in [(0, 2, 16), (3, 2, 16), (0, 4, 16), (0, 2, 256)]:
                         row = next(r for r in result.stdout.splitlines() if r.startswith(f'DATA CACHE core={core} '))
                         assert ' writebacks=0 ' in row and row.endswith(f' memory_write_bytes={4 * stores}'), row
                 print(f'PASS two cores: write={write_policy} policy={policy} delay={delay} ways={ways} block={block} workload={workload}')
+
+        if (delay, ways, block) == (0, 2, 16):
+            for workload, probability, writes in [('fixed', '0', 1), ('uniform', '0', 0), ('locality', '1', 512)]:
+                result = subprocess.run(['./sitar_sim', '100000'], cwd=directory, capture_output=True, text=True,
+                                        env={**os.environ, 'SITAR_WORKLOAD': workload, 'SITAR_P_STORE': probability})
+                assert result.returncode == 0 and 'PASS two_cores=2' in result.stdout, result.stderr
+                assert result.stdout.count(' write=1 error=0') == writes, (workload, probability)
