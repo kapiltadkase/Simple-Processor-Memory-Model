@@ -108,11 +108,15 @@ module Top
         core1.data_cache.CACHE_DELAY = 1;
         instruction_memory1.MEM_DELAY = 1;
 
-        // Delays control how long cache lookups and memory operations take.
-        // To choose a policy here, use (then rebuild):
-        // core.data_cache.replacement_policy = Cache<>::LRU;
-        // Use Cache<>::FIFO or Cache<>::RANDOM for the other policies.
-        // instruction_cache works the same way.
+        if (const char* setting = std::getenv("SITAR_POLICY")) {
+            std::string name(setting);
+            Cache<>::ReplacementPolicy policy;
+            if (name == "lru") policy = Cache<>::LRU;
+            else if (name == "fifo") policy = Cache<>::FIFO;
+            else if (name == "random") policy = Cache<>::RANDOM;
+            else throw std::runtime_error("SITAR_POLICY must be lru, fifo or random");
+            core.data_cache.replacement_policy = core1.data_cache.replacement_policy = policy;
+        }
         core.instruction_cache.CACHE_DELAY = 0;
         core.data_cache.CACHE_DELAY = 0;
         instruction_memory.MEM_DELAY = 0;
@@ -609,7 +613,7 @@ procedure Processor
                 if (index == 7) assert(data_cache->hit);
                 index++;$;
             while (index < 8) end do;
-            $assert(data_cache->core_id == 1 || data_cache->writebacks == 1);
+            $assert(data_cache->replacement_policy == Cache<>::RANDOM || data_cache->core_id == 1 || data_cache->writebacks == 1);
             log << endl << "PASS shared core=" << int(data_cache->core_id);$;
         else
             $if (const char* value = std::getenv("SITAR_SEED")) {

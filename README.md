@@ -4,6 +4,17 @@ Build with `sitar translate main.sitar`, then `sitar compile`; run
 `./sitar_sim 1000`. Expect `PASS shared core=0`, `PASS shared core=1`,
 and `PASS two_cores=2`. Run `python3 check.py` for regressions.
 
+### Run with a replacement policy
+
+From the project directory, run the locality workload with FIFO:
+
+```sh
+SITAR_POLICY=fifo SITAR_WORKLOAD=locality SITAR_SEED=42 ./sitar_sim 100000
+```
+
+Change `fifo` to `lru` or `random` to select that policy for both data caches.
+Omitting `SITAR_POLICY` selects LRU. You can switch policies without rebuilding.
+
 To compare address patterns, run the same binary twice:
 
 ```sh

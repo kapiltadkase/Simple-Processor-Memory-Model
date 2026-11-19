@@ -5,6 +5,7 @@ import re
 import subprocess
 import tempfile
 
+os.environ.pop('SITAR_POLICY', None)  # Each regression selects its own policy.
 shared_source = Path(__file__).with_name('main.sitar').read_text()
 source = re.sub(r'procedure Processor\n.*?end procedure', lambda _: Path(__file__).with_name('mixed.sitar').read_text(), shared_source, flags=re.S)
 source = re.sub(r'^.*peer_done.*\n', '', source, flags=re.M)
@@ -104,17 +105,16 @@ for policy in ("LRU", "FIFO"):
         print(f'PASS {policy}: replacement order and dirty eviction')
 
 # Run both processors against the same repeatable address streams for every policy.
-for delay, policy in [(0, 'LRU'), (3, 'LRU'), (0, 'FIFO'), (0, 'RANDOM')]:
+for delay in (0, 3):
     with tempfile.TemporaryDirectory() as directory:
         model = shared_source.replace('.MEM_DELAY = 0', f'.MEM_DELAY = {delay}')
-        model = model.replace('replacement_policy = LRU', f'replacement_policy = {policy}')
         Path(directory, 'main.sitar').write_text(model)
         for command in [['sitar', 'translate', 'main.sitar'], ['sitar', 'compile']]:
             result = subprocess.run(command, cwd=directory, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
             assert result.returncode == 0 and 'FAILURE' not in result.stdout, result.stdout
-        for workload in (('fixed', 'locality') if policy == 'LRU' else ('locality',)):
+        for policy, workload in [('lru', 'fixed'), ('lru', 'locality'), ('fifo', 'locality'), ('random', 'locality')]:
             result = subprocess.run(['./sitar_sim', '100000'], cwd=directory, text=True,
-                                    capture_output=True, env={**os.environ, 'SITAR_WORKLOAD': workload, 'SITAR_SEED': '42'})
+                                    capture_output=True, env={**os.environ, 'SITAR_POLICY': policy, 'SITAR_WORKLOAD': workload, 'SITAR_SEED': '42'})
             assert result.returncode == 0 and 'PASS two_cores=2' in result.stdout, result.stdout + result.stderr
             if workload == 'fixed':
                 assert all(f'PASS shared core={i}' in result.stdout for i in (0, 1)), result.stdout
