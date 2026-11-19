@@ -5,11 +5,14 @@ import re
 import subprocess
 import tempfile
 
+if not __debug__:
+    raise RuntimeError('Run check.py without Python optimization so regression assertions are enabled')
+
 os.environ.pop('SITAR_POLICY', None)  # Each regression selects its own policy.
 os.environ.pop('SITAR_WRITE_POLICY', None)
 shared_source = Path(__file__).with_name('main.sitar').read_text()
 source = re.sub(r'procedure Processor\n.*?end procedure', lambda _: Path(__file__).with_name('mixed.sitar').read_text(), shared_source, flags=re.S)
-source = re.sub(r'^.*peer_done.*\n', '', source, flags=re.M)
+source = re.sub(r'^.*processor\.peer = .*\n', '', source, flags=re.M)
 source = source.replace('run processor;', 'if ($data_cache.core_id == 0$) then run processor; else $processor.done = true;$; end if;')
 
 # Pause the processors so the test controls exactly when each cache asks for the bus.
@@ -105,10 +108,35 @@ for policy in ("LRU", "FIFO"):
         assert f'PASS {policy}' in result.stdout, result.stdout
         print(f'PASS {policy}: replacement order and dirty eviction')
 
+# Four ways in one set: repeated peer invalidations and refills must leave C oldest.
+ops = [(0, addr, 0) for addr in (0, 16, 32, 48)]
+ops += [(1, 0, 1), (0, 0, 0)] + [(1, 16, 1), (0, 16, 0)] * 6 + [(0, 64, 0)]
+steps = []
+for core_id, addr, write in ops:
+    cache = ('core1' if core_id else 'core') + '.data_cache'
+    steps.append(f'${cache}.address={addr}; {cache}.write={write}; {cache}.request_id++;$;')
+    steps.append(f'wait until (${cache}.response_id == {cache}.request_id$);')
+steps.append('$assert(core.data_cache.find_way(32) < 0);'
+             ' for (auto addr : {0, 16, 48, 64}) assert(core.data_cache.find_way(addr) >= 0);$;')
+four_way = shared_source.replace('NUM_SETS = 2', 'NUM_SETS = 1').replace('NUM_WAYS = 2', 'NUM_WAYS = 4')
+model = four_way.replace('run processor;', 'wait until (0);').replace(
+    'wait until ($core.processor.done && core1.processor.done$);', '\n'.join(steps))
+with tempfile.TemporaryDirectory() as directory:
+    Path(directory, 'main.sitar').write_text(model)
+    for command in [['sitar', 'translate', 'main.sitar'], ['sitar', 'compile']]:
+        result = subprocess.run(command, cwd=directory, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        assert result.returncode == 0 and 'FAILURE' not in result.stdout, result.stdout
+    for policy in ('lru', 'fifo'):
+        result = subprocess.run(['./sitar_sim', '10000'], cwd=directory, text=True, capture_output=True,
+                                env={**os.environ, 'SITAR_POLICY': policy})
+        assert result.returncode == 0 and 'PASS two_cores=2' in result.stdout, result.stdout + result.stderr
+        print(f'PASS {policy}: four-way invalidation and refill order')
+
 # Run both processors against the same repeatable address streams for every policy.
-for delay in (0, 3):
+for delay, ways, block in [(0, 2, 16), (3, 2, 16), (0, 4, 16), (0, 2, 256)]:
     with tempfile.TemporaryDirectory() as directory:
         model = shared_source.replace('.MEM_DELAY = 0', f'.MEM_DELAY = {delay}')
+        model = model.replace('NUM_WAYS = 2', f'NUM_WAYS = {ways}').replace('BLOCK_SIZE = 16', f'BLOCK_SIZE = {block}')
         Path(directory, 'main.sitar').write_text(model)
         for command in [['sitar', 'translate', 'main.sitar'], ['sitar', 'compile']]:
             result = subprocess.run(command, cwd=directory, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
@@ -119,6 +147,9 @@ for delay in (0, 3):
                                         capture_output=True, env={**os.environ, 'SITAR_POLICY': policy, 'SITAR_WRITE_POLICY': write_policy, 'SITAR_WORKLOAD': workload, 'SITAR_SEED': '42'})
                 assert result.returncode == 0 and 'PASS two_cores=2' in result.stdout, result.stdout + result.stderr
                 if workload == 'fixed':
+                    if ways == 2 and block == 16:
+                        row = next(r for r in result.stdout.splitlines() if r.startswith('DATA CACHE core=0 '))
+                        assert f' writebacks={int(write_policy == "write-back")} ' in row, row
                     assert all(f'PASS shared core={i}' in result.stdout for i in (0, 1)), result.stdout
                 else:
                     counts = re.findall(r'DATA CACHE core=[01] hits=(\d+) misses=(\d+)', result.stdout)
@@ -128,4 +159,4 @@ for delay in (0, 3):
                         stores = len(re.findall(rf'ACCESS core={core} .*? write=1 error=0', result.stdout))
                         row = next(r for r in result.stdout.splitlines() if r.startswith(f'DATA CACHE core={core} '))
                         assert ' writebacks=0 ' in row and row.endswith(f' memory_write_bytes={4 * stores}'), row
-                print(f'PASS two cores: write={write_policy} policy={policy} delay={delay} workload={workload}')
+                print(f'PASS two cores: write={write_policy} policy={policy} delay={delay} ways={ways} block={block} workload={workload}')

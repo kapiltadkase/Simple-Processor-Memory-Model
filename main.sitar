@@ -108,8 +108,8 @@ module Top
         core1.instruction_cache.core_id = 1;
         core1.data_cache.core_id = 1;
         instruction_memory1.core_id = 1;
-        core.processor.peer_done = &core1.processor.done;
-        core1.processor.peer_done = &core.processor.done;
+        core.processor.peer = &core1.processor;
+        core1.processor.peer = &core.processor;
         core1.instruction_cache.CACHE_DELAY = 1;
         core1.data_cache.CACHE_DELAY = 1;
         instruction_memory1.MEM_DELAY = 1;
@@ -356,15 +356,11 @@ procedure Cache
         // A fixed seed makes random replacement repeatable between simulation runs.
         std::mt19937 generator{1};
 
-        // Replacement ranks: 0 means newest; larger numbers mean older, within each set.
-        // LRU updates them on every access; FIFO updates them only when loading a block.
-        int recency[NUM_SETS][NUM_WAYS] = {};
-        // LRU / FIFO shared helper: mark this block newest and age the blocks that were newer.
+        // A serial number orders touches even when several complete in the same tick.
+        uint64_t last_touch[NUM_SETS][NUM_WAYS] = {};
+        uint64_t touch_sequence = 0;
         void touch(int set, int accessed) {
-            for (int i = 0; i < NUM_WAYS; i++)
-                if (mesi[set][i] != MesiState::I && i != accessed && recency[set][i] <= recency[set][accessed])
-                    recency[set][i]++;
-            recency[set][accessed] = 0;
+            last_touch[set][accessed] = ++touch_sequence;
         }
 
         // Keep the active request safe while waiting for memory.
@@ -444,10 +440,10 @@ procedure Cache
                         if (replacement_policy == RANDOM)
                             way = std::uniform_int_distribution<int>(0, NUM_WAYS - 1)(generator);
                         else {
-                            // LRU / FIFO replacement: evict the largest rank (oldest use / oldest insertion).
+                            // LRU / FIFO replacement: evict the oldest use / oldest insertion.
                             way = 0;
                             for (int i = 1; i < NUM_WAYS; i++)
-                                if (recency[slot][i] > recency[slot][way]) way = i;
+                                if (last_touch[slot][i] < last_touch[slot][way]) way = i;
                         }
                     }
                     // Remember where the old block belongs in memory before replacing it.
@@ -532,12 +528,9 @@ procedure Cache
                         save_word(offset, saved_data);
                         mesi[slot][way] = write_through ? MesiState::E : MesiState::M;
                     }
-                    // LRU policy: update ranks on every successful access, including hits.
-                    // FIFO policy: update ranks only on insertion (a miss); hits keep their place.
-                    if (!error && (replacement_policy == LRU || (replacement_policy == FIFO && !hit))) {
-                        if (!hit) recency[slot][way] = NUM_WAYS;
+                    // LRU records each access; FIFO records only insertions.
+                    if (!error && (replacement_policy == LRU || (replacement_policy == FIFO && !hit)))
                         touch(slot, way);
-                    }
                     read_data = error ? 0 : line_word(slot, way, offset);$;
                 end if;
                 $
@@ -616,7 +609,7 @@ procedure Processor
         Cache<>* instruction_cache = nullptr;
         Cache<>* data_cache = nullptr;
         bool done = false;
-        bool* peer_done = nullptr;
+        Processor* peer = nullptr;
         int index = 0;
         std::mt19937 rng;
         std::string workload = "fixed";
@@ -629,8 +622,13 @@ procedure Processor
             throw std::runtime_error("Choose fixed, uniform or locality for SITAR_WORKLOAD");$;
         if ($workload == "fixed"$) then
             do
-                if (index == 3 and $data_cache->core_id == 1$) then
-                    wait until ($*peer_done$);
+                if (index == 3) then
+                    // Both cores must see the initial word before the store; core 1 rereads it last.
+                    if ($data_cache->core_id == 0$) then
+                        wait until ($peer->index > 0$);
+                    else
+                        wait until ($peer->done$);
+                    end if;
                 end if;
                 $data_cache->address = addresses[index];
                 data_cache->write = index == 3 && data_cache->core_id == 0;
@@ -642,8 +640,7 @@ procedure Processor
                 if (index == 7) assert(data_cache->hit);
                 index++;$;
             while (index < 8) end do;
-            $assert(data_cache->replacement_policy == Cache<>::RANDOM || data_cache->core_id == 1 || data_cache->writebacks == (data_cache->write_through ? 0u : 1u));
-            log << endl << "PASS shared core=" << int(data_cache->core_id);$;
+            $log << endl << "PASS shared core=" << int(data_cache->core_id);$;
         else
             $if (const char* value = std::getenv("SITAR_SEED")) {
                 std::string digits(value);
